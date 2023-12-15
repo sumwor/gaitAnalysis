@@ -9,12 +9,14 @@
 # 6. body direction: spine 1 (base of neck) to tail (base of tail)
 # 7. time in center zone and outer zone (the area of zones need to be determined session by session
 #    (consider adding a reference to make sure the camera is always in place)
-# to be added in Deeplabcut:
+#todo: to be added in Deeplabcut:
 # 1. stride length (two hind paws at least)
 # 2. step length
 # 3. step width
 # 4. nose/tail displacement
-# 5.
+# Moseq:
+# state transition matrix with time (darker color for current syllable, degraded color for
+# previous syllables
 
 
 """ questions for openfield behavior
@@ -46,6 +48,9 @@ import subprocess as sp
 import multiprocessing
 import concurrent.futures
 import functools
+
+# todo:
+# 1. check the open field paper for related plots
 
 class DLCData:
 
@@ -125,6 +130,22 @@ class DLCData:
                    self.arena['lower right'][0], self.arena['lower left'][0], self.arena['upper left'][0]]
         arena_y = [self.arena['upper left'][1], self.arena['upper right'][1],
                    self.arena['lower right'][1], self.arena['lower left'][1], self.arena['upper left'][1]]
+
+        # get the instantaneous distance from center
+        slope1 = (self.arena['upper left'][1] - self.arena['lower right'][1]) / (self.arena['upper left'][0] - self.arena['lower right'][0])
+        slope2 = (self.arena['lower left'][1] - self.arena['upper right'][1]) / (self.arena['lower left'][0] - self.arena['upper right'][0])
+
+        # Calculate the x-coordinate of the intersection point
+        x_intersection = ((self.arena['upper right'][1] - self.arena['upper left'][1]) + slope1 * self.arena['upper left'][0] - slope2 * self.arena['upper right'][0]) / (slope1 - slope2)
+
+        # Calculate the y-coordinate of the intersection point
+        y_intersection = slope1 * (x_intersection - self.arena['upper left'][0]) + self.arena['upper left'][1]
+
+        self.center_point = [x_intersection, y_intersection]
+
+        self.dist_center = np.sqrt((self.data['tail 1']['x']-self.center_point[0])**2 +
+                                   (self.data['tail 1']['y']-self.center_point[1])**2)
+
         tracePlot = StartPlots()
         tracePlot.ax.plot(arena_x, arena_y)
         tracePlot.ax.plot(self.data['tail 1']['x'], self.data['tail 1']['y'])
@@ -171,14 +192,26 @@ class DLCData:
         else:
             print("please run moving_trace first")
 
-    #def plot_frame_label(self, frame):
-    #    image = read_video(self.videoPath, frame, ifgray = False)
-    #    labelPlot = StartPlots()
-    #    labelPlot.ax.imshow(image)
-    #    for bb in self.data['bodyparts']:
-    #        labelPlot.ax.scatter(self.data[bb]['x'][frame], self.data[bb]['y'][frame])
+    def plot_distance_to_center(self, t, savefigpath):
+        # plot the distribution of distance to center
+        # as well as a function of time
+        distPlot = StartPlots()
+        self.dist_center_bins = distPlot.ax.hist(self.dist_center, bins = np.linspace(0, 1200, 101))
+        distPlot.ax.set_xlabel('Distance from center (px)')
+        distPlot.ax.set_ylabel('Occurance')
+        distPlot.save_plot('Distribution of distance from center.tiff', 'tiff', savefigpath)
+        # average distance from center in a running window
+        self.dist_center_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+        for ff in range(self.nFrames - 1 - t*self.fps):
+            self.dist_center_running[ff] = np.nanmean(self.dist_center[ff:ff+t*self.fps])
 
-    #    labelPlot.legend(self.data['bodyparts'])
+        distRunningPlot = StartPlots()
+        distRunningPlot.ax.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.dist_center_running)
+        distRunningPlot.ax.set_ylabel('Average distance from center (px)')
+        distRunningPlot.ax.set_xlabel('Time (s)')
+
+        distRunningPlot.save_plot('Average distance from center.tiff', 'tiff', savefigpath)
+        plt.close('all')
 
     def read_data(self):
         data = {}
@@ -250,6 +283,28 @@ class DLCData:
             if ff<self.nFrames-2:
                 self.accel[ff] = (self.vel[ff+1]-self.vel[ff])*self.fps
 
+    def get_movement_running(self, t, savefigpath):
+        # get average distance and velocity in running window of t seconds
+        self.vel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+        self.dist_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+        self.accel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+
+        for ff in range(self.nFrames - 1 - t*self.fps):
+            self.dist_running[ff] = np.sum(self.dist[ff:ff+t*self.fps])
+            self.vel_running[ff] = np.nanmean(self.vel[ff:ff+t*self.fps])
+            self.accel_running[ff] = np.nanmean(self.accel[ff:ff+t*self.fps])
+            self.vel[ff] = (self.dist[ff]) * self.fps
+
+        velPlot = StartPlots()
+        velPlot.ax.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.dist_running)
+        velPlot.ax.set_ylabel('Average distance traveled (px)')
+        #ax2 = velPlot.ax.twinx()
+        #ax2.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.vel_running, color='red')
+        #ax2.set_ylabel('Average velocity')
+        velPlot.ax.set_xlabel('Time (s)')
+
+        velPlot.save_plot('Running distance and velocity.tiff', 'tiff', savefigpath)
+        plt.close(velPlot.fig)
     def get_angular_velocity(self):
         # calculate angular velocity based on tail and spine 1
         self.angVel = np.zeros((self.nFrames-1, 1))
@@ -278,6 +333,27 @@ class DLCData:
 
             self.headAngVel[ff] = self.get_angle(v1, v2) * self.fps
 
+    def get_angular_velocity_running(self, t, savefigpath):
+        # calculate angular velocity with running window t
+        self.angVel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+        self.headAngVel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+
+        for ff in range(self.nFrames - 1 - t*self.fps):
+            self.angVel_running[ff] = np.nanmean(self.angVel[ff:ff+t*self.fps])
+            self.headAngVel_running[ff] = np.nanmean(self.headAngVel[ff:ff+t*self.fps])
+
+        # plot the velocity here
+        angPlot = StartPlots()
+        angPlot.ax.plot(self.t[0:self.nFrames - 1 - t*self.fps], self.angVel_running)
+        angPlot.ax.set_ylabel('Angular velocity')
+        ax2 = angPlot.ax.twinx()
+        ax2.plot(self.t[0:self.nFrames - 1 - t*self.fps], self.headAngVel_running, color='red')
+        ax2.set_ylabel('Head angular velocity', color='red')
+        angPlot.ax.set_xlabel('Time (s)')
+
+        angPlot.save_plot('Running angular vel.tiff', 'tiff', savefigpath)
+        plt.close(angPlot.fig)
+
     def get_angle(self, v1, v2):
         # get angle between two vectors
             v1_u = self.unit_vector(v1)
@@ -291,56 +367,6 @@ class DLCData:
     def unit_vector(self, v):
         """ Returns the unit vector of the vector.  """
         return v / np.linalg.norm(v)
-
-    # def generate_videos(self, timeInterval, videoFilePath):
-    #     # generate pose estimation videos with velocity, head direction, angular velocity ploted simutaneously
-    #     # timeInterval: time interval for the video
-    #     # get number of frames based on timeInterval
-    #     frameIdx = np.arange(self.nFrames)
-    #     frames = frameIdx[np.logical_and(self.t>=timeInterval[0],
-    #         self.t<timeInterval[-1])]
-    #     plotTime = self.t[np.logical_and(self.t>=timeInterval[0],
-    #         self.t<timeInterval[-1])]
-    #     frameCount = 0
-    #     videoFrames = []
-    #
-    #     labelPlot = StartSubplots(4, 1, gridspec_kw=[1, 1, 1, 20])
-    #
-    #     writer = animation.FFMpegWriter(fps = 40)
-    #     with writer.saving(labelPlot.fig, videoFilePath, dpi = 100):
-    #         for f in tqdm(frames):
-    #             # clear the last frame
-    #             for ax in labelPlot.ax:
-    #                 ax.clear()
-    #         #gs = gridspec.GridSpec(4, 1, height_ratios=[1,1,1,20])
-    #             image = read_video(f, ifgray = True)
-    #                    #labelPlot.ax[3].subplot(gs[3])
-    #             labelPlot.ax[3].imshow(image, cmap = 'gray')
-    #             for bb in self.data['bodyparts']:
-    #                 labelPlot.ax[3].scatter(self.data[bb]['x'][f],
-    #                                  self.data[bb]['y'][f])
-    #             #labelPlot.legend(3, 0, self.data['bodyparts'])
-    #
-    #             # plot velocity
-    #             labelPlot.ax[0].plot(plotTime[0:frameCount+1],
-    #                              self.vel[frames[0:frameCount+1]], label='velocity')
-    #             labelPlot.ax[0].set_ylabel('Vel')
-    #             labelPlot.ax[0].set_xlim(plotTime[0], plotTime[-1])
-    #             labelPlot.ax[0].set_ylim(min(self.vel[frames]),
-    #                                      max(self.vel[frames]))
-    #             labelPlot.ax[1].plot(plotTime[0:frameCount+1],
-    #                              self.angVel[frames[0:frameCount+1]], label='angular velocity')
-    #             labelPlot.ax[1].set_ylabel('BD')
-    #             labelPlot.ax[1].set_xlim(plotTime[0], plotTime[-1])
-    #             labelPlot.ax[1].set_ylim(-np.pi, np.pi)
-    #             labelPlot.ax[2].plot(plotTime[0:frameCount+1],
-    #                              self.headAngVel[frames[0:frameCount+1]], label='head direction')
-    #             labelPlot.ax[2].set_ylabel('HD')
-    #             labelPlot.ax[2].set_xlim(plotTime[0], plotTime[-1])
-    #             labelPlot.ax[2].set_ylim(-np.pi, np.pi)
-    #
-    #             frameCount += 1
-    #             writer.grab_frame()
 
 class Moseq:
 
@@ -831,7 +857,7 @@ class Moseq:
             # Plot the density distribution
                 plt.figure(figsize=(10, 8))
                 plt.contourf(grid_x, grid_y, kde, levels=20, cmap='viridis')
-                    plt.colorbar(label='Density')
+                plt.colorbar(label='Density')
             #plt.scatter(x, y, s=10, color='black', alpha=0.5)
                 plt.xlabel('X')
                 plt.ylabel('Y')
@@ -839,7 +865,6 @@ class Moseq:
                 plt.show()
 # generate a video clip with syllables marked on top?
 #
-
 class DLCSummary:
     """class to summarize DLC data and analysis"""
 
@@ -861,8 +886,8 @@ class DLCSummary:
         DLC_results = []
         video = []
         for aa in animals:
-            filePatternCSV = aa + '*.csv'
-            filePatternVideo = aa + '*.mp4'
+            filePatternCSV = '*' + aa + '*.csv'
+            filePatternVideo = '*' + aa + '*.mp4'
             DLC_results.append(glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")[0])
             video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[0])
         self.data['CSV'] = DLC_results
@@ -930,6 +955,11 @@ class DLCSummary:
             counts, _ = np.histogram(obj.headAngVel, bins=angEdges)
             headAngularDist[0:-1, idx] = counts * 100 / (sum(counts))
 
+            # running windows
+            savefigFolder = os.path.join(self.analysisFolder, self.animals[idx])
+            t = 5*60  # running windos of 5 mins
+            obj.get_movement_running(t, savefigFolder)
+            obj.get_angular_velocity_running(t, savefigFolder)
         """ make plots"""
         """distance plot"""
         WTBoot = bootstrap(distanceMat[:, self.WTIdx], 1,
@@ -1014,6 +1044,7 @@ class DLCSummary:
 
     def center_analysis(self, savefigpath):
         centerMat = np.full((self.minFrames, self.nSubjects), np.nan)
+
         plotT = np.arange(self.minFrames)/self.fps
         for idx, obj in enumerate(self.data['DLC_obj']):
             savefigFolder = os.path.join(self.analysisFolder, self.animals[idx])
@@ -1022,6 +1053,16 @@ class DLCSummary:
             obj.moving_trace(savefigFolder)
             obj.get_time_in_center()
             centerMat[:,idx] = obj.cumu_time_center[0:self.minFrames]
+            if idx==0:
+                nbins = len(obj.dist_center_bins[1])
+                centerDistMat = np.full((nbins-1, self.nSubjects), np.nan)
+            centerDistMat[:,idx] = obj.dist_center_bins[0]
+
+            t = 5*60
+            obj.plot_distance_to_center(t, savefigFolder)
+            #obj.get_movement_running(savefigFolder)
+            #obj.get_angular_velocity_running(savefigFolder)
+        # save centerMat result
 
         WTBoot = bootstrap(centerMat[:, self.WTIdx], 1,
                                centerMat[:, self.WTIdx].shape[0])
@@ -1041,15 +1082,37 @@ class DLCSummary:
         distPlot.ax.set_ylabel('Time spent in the center (s)')
         distPlot.legend(['WT', 'Mut'])
         # save the plot
-        distPlot.save_plot('Time spent in the center.tif', 'tif', savefigFolder)
-        distPlot.save_plot('Time spent in the center.svg', 'svg', savefigFolder)
+        distPlot.save_plot('Time spent in the center.tif', 'tif', savefigpath)
+        distPlot.save_plot('Time spent in the center.svg', 'svg', savefigpath)
+
+        # distribution of distance from center
+        WTBoot = bootstrap(centerDistMat[:, self.WTIdx], 1,
+                               centerDistMat[:, self.WTIdx].shape[0])
+        MutBoot = bootstrap(centerDistMat[:, self.MutIdx], 1,
+                                centerDistMat[:, self.MutIdx].shape[0])
+        binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:])/2
+        distPlot = StartPlots()
+        distPlot.ax.plot(binX, WTBoot['bootAve'], color=WTColor, label='WT')
+        distPlot.ax.fill_between(binX, WTBoot['bootLow'],
+                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        distPlot.ax.plot(binX, MutBoot['bootAve'], color=MutColor, label='Mut')
+        distPlot.ax.fill_between(binX, MutBoot['bootLow'],
+                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        distPlot.ax.set_xlabel('Distance from center (px)')
+        distPlot.ax.set_ylabel('Number of frames')
+        distPlot.legend(['WT', 'Mut'])
+        # save the plot
+        distPlot.save_plot('Distribution of distance from center.tif', 'tif', savefigpath)
+        distPlot.save_plot('Distribution of distance from center.svg', 'svg', savefigpath)
 
 if __name__ == "__main__":
-    root_dir = r'D:\openfield_cntnap'
+    root_dir = r'Z:\HongliWang\openfield\katie\DLC'
     dataFolder = os.path.join(root_dir,'Data')
-    animals = ['M1595', 'M1603', 'M1612', 'M1613', 'M1615', 'M1619']
+    animals = ['1795', '1804', '1805', '1825', '1827', '1829']
+    #animals = ['M3', 'M4', 'M5', 'M6']
     # add animal identity
-    GeneBG = ['Mut', 'WT', 'WT', 'Mut', 'WT', 'Mut']
+    #GeneBG = ['WT', 'Mut', 'Mut', 'WT']
+    GeneBG = ['WT', 'Mut', 'WT', 'Mut', 'Mut', 'WT']
     fps = 40
 
     """analysis
@@ -1064,19 +1127,19 @@ if __name__ == "__main__":
     #
     # make these plot functions?
     # plot the cumulative distance traveled
-    savemotionpath = r'D:\openfield_cntnap\Summary\DLC'
+    savemotionpath = r'Z:\HongliWang\openfield\katie\DLC\Summary\DLC'
 
     DLCSum = DLCSummary(dataFolder, animals, GeneBG, fps)
 
     # basic motor-related analysis
     #DLCSum.motion_analysis(savemotionpath)
-    #DLCSum.center_analysis(savemotionpath)
+    DLCSum.center_analysis(savemotionpath)
     # analysis to do
     # moving trace ( require user input to mark the open field area)
     # time spend in the center (same)
     # tail movement in egocentric coordinates
-    # savefigpath = r'D:\openfield_cntnap\Analysis\DLC\1595'
-    # tt=DLCSum.data['DLC_obj'][0].moving_trace(savefigpath)
+    savefigpath = r'D:\openfield_MGRPR\old\Analysis\DLC\1595'
+    tt=DLCSum.data['DLC_obj'][0].moving_trace(savefigpath)
     """ keypoint-moseq analysis"""
     # DLCSum.data['DLC_obj'][0].get_time_in_center()
     moseqResults = r'D:\openfield_cntnap\Data\Moseq\results.h5'
