@@ -23,7 +23,7 @@
 1. individual variance v.s. genotype variance"""
 import csv
 import os.path
-
+import ast
 import pandas as pd
 import glob
 import numpy as np
@@ -124,7 +124,28 @@ class DLCData:
     def moving_trace(self, savefigpath):
         """ plot animal moving trace in the field"""
         if not hasattr(self, 'arena'):
-            self.arena = frame_input(self.videoPath)
+            savedatapath = os.path.join(savefigpath, 'arena_coordinates.csv')
+            if not os.path.exists(savedatapath):
+                self.arena = frame_input(self.videoPath)
+                # save the results:
+                with open(savedatapath, 'w') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['upper left',
+                                     'upper right',
+                                     'lower right',
+                                     'lower left'])
+                    writer.writerow([self.arena['upper left'],
+                                    self.arena['upper right'],
+                                    self.arena['lower right'],
+                                    self.arena['lower left']])
+                    f.close()
+            else:
+                # read data from file
+                tempdata= pd.read_csv(savedatapath)
+                self.arena = {}
+                for key in tempdata.keys():
+                    self.arena[key] = ast.literal_eval(tempdata[key].values[0])
+        # save the coordinates in analysis folder
 
         arena_x = [self.arena['upper left'][0], self.arena['upper right'][0],
                    self.arena['lower right'][0], self.arena['lower left'][0], self.arena['upper left'][0]]
@@ -143,8 +164,8 @@ class DLCData:
 
         self.center_point = [x_intersection, y_intersection]
 
-        self.dist_center = np.sqrt((self.data['tail 1']['x']-self.center_point[0])**2 +
-                                   (self.data['tail 1']['y']-self.center_point[1])**2)
+        self.dist_center = np.sqrt((np.array(self.data['tail 1']['x'])-self.center_point[0])**2 +
+                                   (np.array(self.data['tail 1']['y'])-self.center_point[1])**2)
 
         tracePlot = StartPlots()
         tracePlot.ax.plot(arena_x, arena_y)
@@ -868,13 +889,15 @@ class Moseq:
 class DLCSummary:
     """class to summarize DLC data and analysis"""
 
-    def __init__(self, root_folder, animals, GeneBG, fps):
+    def __init__(self, root_folder, fps):
         self.rootFolder = root_folder
         self.dataFolder = os.path.join(root_folder, 'Data')
         self.analysisFolder = os.path.join(root_folder, 'Analysis')
         self.sumFolder = os.path.join(root_folder, 'Summary')
-        self.animals = animals
-        self.GeneBG = GeneBG
+        output = self.get_animalInfo(root_folder)
+        self.animals = output['animals']
+        self.GeneBG = output['geneBG']
+        self.Sex = output['sex']
         self.fps = fps
 
         # make directories
@@ -882,19 +905,19 @@ class DLCSummary:
             os.makedirs(self.analysisFolder)
         if not os.path.exists(self.sumFolder):
             os.makedirs(self.sumFolder)
-        self.data = pd.DataFrame(animals, columns=['Animal'])
+        self.data = pd.DataFrame(self.animals, columns=['Animal'])
         DLC_results = []
         video = []
-        for aa in animals:
+        for aa in self.animals:
             filePatternCSV = '*' + aa + '*.csv'
             filePatternVideo = '*' + aa + '*.mp4'
             DLC_results.append(glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")[0])
             video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[0])
         self.data['CSV'] = DLC_results
         self.data['Video'] = video
-        self.data['GeneBG'] = GeneBG
-
-        self.nSubjects = len(animals)
+        self.data['GeneBG'] = self.GeneBG
+        self.data['Sex'] = self.Sex
+        self.nSubjects = len(self.animals)
         DLC_obj = []
         minFrames = 10 ** 8
         for s in range(self.nSubjects):
@@ -910,7 +933,23 @@ class DLCSummary:
         self.plotT = np.arange(0, minFrames-1)/fps
         animalIdx = np.arange(self.nSubjects)
         self.WTIdx = animalIdx[self.data['GeneBG'] == 'WT']
-        self.MutIdx = animalIdx[self.data['GeneBG'] == 'Mut']
+        self.MutIdx = animalIdx[np.logical_or(self.data['GeneBG'] == 'KO',
+                                              self.data['GeneBG'] == 'Mut')]
+
+    def get_animalInfo(self, root_folder):
+        animalInfoFile = os.path.join(root_folder, 'animalInfo.csv')
+        animalInfo = pd.read_csv(animalInfoFile)
+        animals = animalInfo['AnimalID'].values
+        geneBG = animalInfo['Genotype'].values
+        if 'Sex' in animalInfo.keys():
+            sex = animalInfo['Sex'].values
+        else:
+            sex = np.full(len(animals), np.nan)
+        # convert animal to string
+        animals = list(map(str, animals))
+
+        output = {'animals': animals, 'geneBG': geneBG, 'sex': sex}
+        return output
 
     def plot_outlier_frames(self):
         for idx, animal in enumerate(self.animals):
@@ -930,7 +969,9 @@ class DLCSummary:
         # distance traveled, speed, angular velocity...
         distanceMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
         velocityMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
-
+        # in 5 mins window
+        runningAve_distance = np.full((self.minFrames - 1, self.nSubjects), np.nan)
+        runningAve_velocity = np.full((self.minFrames - 1, self.nSubjects), np.nan)
         #
         velEdges = np.arange(0, 1000, 10)
         velocityDist = np.full((len(velEdges), self.nSubjects), np.nan)
@@ -960,12 +1001,20 @@ class DLCSummary:
             t = 5*60  # running windos of 5 mins
             obj.get_movement_running(t, savefigFolder)
             obj.get_angular_velocity_running(t, savefigFolder)
+
+            runningAve_distance[0:len(obj.dist_running),idx]=obj.dist_running.flatten()
+            runningAve_velocity[0:len(obj.dist_running), idx] = obj.vel_running.flatten()
         """ make plots"""
         """distance plot"""
+        if 'KO' in np.unique(self.data['GeneBG']):
+            mutLabel = 'KO'
+        elif 'Mut' in np.unique(self.data['GeneBG']):
+            mutLabel = 'Mut'
+
         WTBoot = bootstrap(distanceMat[:, self.WTIdx], 1,
-                               distanceMat[:, self.WTIdx].shape[0])
+                               distanceMat[:, self.WTIdx].shape[0], 500)
         MutBoot = bootstrap(distanceMat[:, self.MutIdx], 1,
-                                distanceMat[:, self.MutIdx].shape[0])
+                                distanceMat[:, self.MutIdx].shape[0],500)
         WTColor = (255 / 255, 189 / 255, 53 / 255)
         MutColor = (63 / 255, 167 / 255, 150 / 255)
 
@@ -973,12 +1022,12 @@ class DLCSummary:
         distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
         distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
                                      WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='Mut')
+        distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
         distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
                                      MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
         distPlot.ax.set_xlabel('Time (s)')
         distPlot.ax.set_ylabel('Distance travelled (px)')
-        distPlot.legend(['WT', 'Mut'])
+        distPlot.legend(['WT', 'KO'])
         # save the plot
         distPlot.save_plot('Distance traveled.tif', 'tif', savefigpath)
         distPlot.save_plot('Distance traveled.svg', 'svg', savefigpath)
@@ -992,12 +1041,12 @@ class DLCSummary:
         velPlot.ax.plot(velEdges, WTBoot['bootAve'], color=WTColor, label='WT')
         velPlot.ax.fill_between(velEdges, WTBoot['bootLow'],
                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        velPlot.ax.plot(velEdges, MutBoot['bootAve'], color=MutColor, label='Mut')
+        velPlot.ax.plot(velEdges, MutBoot['bootAve'], color=MutColor, label='KO')
         velPlot.ax.fill_between(velEdges, MutBoot['bootLow'],
                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
         velPlot.ax.set_xlabel('Velocity (px/s)')
         velPlot.ax.set_ylabel('Velocity distribution (%)')
-        velPlot.legend(['WT', 'Mut'])
+        velPlot.legend(['WT', 'KO'])
         velPlot.save_plot('Velocity distribution.tif', 'tif', savefigpath)
         velPlot.save_plot('Velocity distribution.svg', 'svg', savefigpath)
 
@@ -1040,10 +1089,51 @@ class DLCSummary:
         angPlot.save_plot('Angular velocity(head) distribution.tif', 'tif', savefigpath)
         angPlot.save_plot('Angular velocity(head distribution.svg', 'svg', savefigpath)
 
+
+        # distance and velocity in 5 mins running window
+        WTBoot = bootstrap(runningAve_distance[:, self.WTIdx], 1,
+                               runningAve_distance[:, self.WTIdx].shape[0], 500)
+        MutBoot = bootstrap(runningAve_distance[:, self.MutIdx], 1,
+                                runningAve_distance[:, self.MutIdx].shape[0],500)
+
+        distPlot = StartPlots()
+        distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
+                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
+                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        distPlot.ax.set_xlabel('Time (s)')
+        distPlot.ax.set_ylabel('Running average distance travelled in 5 mins (px)')
+        distPlot.legend(['WT', 'KO'])
+        # save the plot
+        distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
+        distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
+
+        WTBoot = bootstrap(runningAve_velocity[:, self.WTIdx], 1,
+                               runningAve_velocity[:, self.WTIdx].shape[0], 500)
+        MutBoot = bootstrap(runningAve_velocity[:, self.MutIdx], 1,
+                                runningAve_velocity[:, self.MutIdx].shape[0],500)
+
+        distPlot = StartPlots()
+        distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
+                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
+                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        distPlot.ax.set_xlabel('Time (s)')
+        distPlot.ax.set_ylabel('Running average velocity in 5 mins (px)')
+        distPlot.legend(['WT', 'KO'])
+        # save the plot
+        distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
+        distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
+
         plt.close('all')
 
     def center_analysis(self, savefigpath):
         centerMat = np.full((self.minFrames, self.nSubjects), np.nan)
+        runningAve_center = np.full((self.minFrames, self.nSubjects), np.nan)
 
         plotT = np.arange(self.minFrames)/self.fps
         for idx, obj in enumerate(self.data['DLC_obj']):
@@ -1052,16 +1142,17 @@ class DLCSummary:
                 os.makedirs(savefigFolder)
             obj.moving_trace(savefigFolder)
             obj.get_time_in_center()
+            t = 5*60
+            obj.plot_distance_to_center(t, savefigFolder)
             centerMat[:,idx] = obj.cumu_time_center[0:self.minFrames]
             if idx==0:
                 nbins = len(obj.dist_center_bins[1])
                 centerDistMat = np.full((nbins-1, self.nSubjects), np.nan)
             centerDistMat[:,idx] = obj.dist_center_bins[0]
 
-            t = 5*60
-            obj.plot_distance_to_center(t, savefigFolder)
-            #obj.get_movement_running(savefigFolder)
-            #obj.get_angular_velocity_running(savefigFolder)
+            runningAve_center[0: len(obj.dist_center_running), idx]=obj.dist_center_running.flatten()
+
+
         # save centerMat result
 
         WTBoot = bootstrap(centerMat[:, self.WTIdx], 1,
@@ -1075,12 +1166,12 @@ class DLCSummary:
         distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
         distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
                                      WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='Mut')
+        distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
         distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
                                      MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
         distPlot.ax.set_xlabel('Time (s)')
         distPlot.ax.set_ylabel('Time spent in the center (s)')
-        distPlot.legend(['WT', 'Mut'])
+        distPlot.legend(['WT', 'KO'])
         # save the plot
         distPlot.save_plot('Time spent in the center.tif', 'tif', savefigpath)
         distPlot.save_plot('Time spent in the center.svg', 'svg', savefigpath)
@@ -1095,24 +1186,44 @@ class DLCSummary:
         distPlot.ax.plot(binX, WTBoot['bootAve'], color=WTColor, label='WT')
         distPlot.ax.fill_between(binX, WTBoot['bootLow'],
                                      WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.plot(binX, MutBoot['bootAve'], color=MutColor, label='Mut')
+        distPlot.ax.plot(binX, MutBoot['bootAve'], color=MutColor, label='KO')
         distPlot.ax.fill_between(binX, MutBoot['bootLow'],
                                      MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
         distPlot.ax.set_xlabel('Distance from center (px)')
         distPlot.ax.set_ylabel('Number of frames')
-        distPlot.legend(['WT', 'Mut'])
+        distPlot.legend(['WT', 'KO'])
         # save the plot
         distPlot.save_plot('Distribution of distance from center.tif', 'tif', savefigpath)
         distPlot.save_plot('Distribution of distance from center.svg', 'svg', savefigpath)
 
+        # plot average distance from center in running windows
+        WTBoot = bootstrap(runningAve_center[:, self.WTIdx], 1,
+                               runningAve_center[:, self.WTIdx].shape[0])
+        MutBoot = bootstrap(runningAve_center[:, self.MutIdx], 1,
+                                runningAve_center[:, self.MutIdx].shape[0])
+
+        distPlot = StartPlots()
+        distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
+                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
+                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        distPlot.ax.set_xlabel('Time (s)')
+        distPlot.ax.set_ylabel('Time spent in the center in running 5 mins windows (s)')
+        distPlot.legend(['WT', 'KO'])
+        # save the plot
+        distPlot.save_plot('Time spent in the center in running 5 mins windows.tif', 'tif', savefigpath)
+        distPlot.save_plot('Time spent in the center in running 5 mins windows.svg', 'svg', savefigpath)
+
 if __name__ == "__main__":
-    root_dir = r'Z:\HongliWang\openfield\katie\DLC'
+    root_dir = r'Z:\HongliWang\openfield\katie\openfield_Cnt2'
     dataFolder = os.path.join(root_dir,'Data')
-    animals = ['1795', '1804', '1805', '1825', '1827', '1829']
+    #animals = ['1795', '1804', '1805', '1825', '1827', '1829']
     #animals = ['M3', 'M4', 'M5', 'M6']
     # add animal identity
     #GeneBG = ['WT', 'Mut', 'Mut', 'WT']
-    GeneBG = ['WT', 'Mut', 'WT', 'Mut', 'Mut', 'WT']
+    #GeneBG = ['WT', 'Mut', 'WT', 'Mut', 'Mut', 'WT']
     fps = 40
 
     """analysis
@@ -1127,12 +1238,12 @@ if __name__ == "__main__":
     #
     # make these plot functions?
     # plot the cumulative distance traveled
-    savemotionpath = r'Z:\HongliWang\openfield\katie\DLC\Summary\DLC'
+    savemotionpath = os.path.join(root_dir, 'Summary', 'DLC')
 
-    DLCSum = DLCSummary(dataFolder, animals, GeneBG, fps)
+    DLCSum = DLCSummary(root_dir, fps)
 
     # basic motor-related analysis
-    #DLCSum.motion_analysis(savemotionpath)
+    DLCSum.motion_analysis(savemotionpath)
     DLCSum.center_analysis(savemotionpath)
     # analysis to do
     # moving trace ( require user input to mark the open field area)

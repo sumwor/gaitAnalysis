@@ -94,7 +94,7 @@ def frame_input(videoPath):
     cid = fig.canvas.mpl_connect('button_press_event', onclick)
 
     # Add a button to confirm input after 4 clicks
-    button_ax = plt.axes([0.8, 0.05, 0.1, 0.075])  # Button position [x, y, width, height]
+    button_ax = plt.axes([0.8, 0.05, 0.1, 0.02])  # Button position [x, y, width, height]
     button = plt.Button(button_ax, 'Confirm')
 
     confirm_clicked = False
