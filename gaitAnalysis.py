@@ -26,6 +26,7 @@ import os.path
 import ast
 import pandas as pd
 import glob
+import pickle
 import numpy as np
 from matplotlib import pyplot as plt
 import imageio
@@ -42,7 +43,8 @@ import matplotlib.ticker as ticker
 from tqdm import tqdm
 from utility_HW import bootstrap
 import h5py
-
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
 import io
 import subprocess as sp
 import multiprocessing
@@ -54,13 +56,14 @@ import functools
 
 class DLCData:
 
-    def __init__(self, filePath, videoPath, fps):
+    def __init__(self, filePath, videoPath, analysisPath, fps):
         self.filePath = filePath
         self.videoPath = videoPath
         self.nFrames = 0
         self.fps = fps
         # read data
         self.data = self.read_data()
+        self.analysis = analysisPath
         #self.video = self.read_video()
 
     def get_confidence(self, p_threshold, savefigpath):
@@ -167,6 +170,7 @@ class DLCData:
         self.dist_center = np.sqrt((np.array(self.data['tail 1']['x'])-self.center_point[0])**2 +
                                    (np.array(self.data['tail 1']['y'])-self.center_point[1])**2)
 
+
         tracePlot = StartPlots()
         tracePlot.ax.plot(arena_x, arena_y)
         tracePlot.ax.plot(self.data['tail 1']['x'], self.data['tail 1']['y'])
@@ -198,10 +202,17 @@ class DLCData:
             y_lower = (self.center['lower left'][1] + self.center['lower right'][1])/2
 
             is_center = np.zeros(len(self.data['tail 1']['x']))
+            num_cross = 0
+            self.num_cross = []  # number of times the animal crosses the border line of center area
             for idx in range(len(self.data['tail 1']['x'])):
                 if self.data['tail 1']['x'][idx] > x_left and self.data['tail 1']['x'][idx] < x_right:
                     if self.data['tail 1']['y'][idx] > y_upper and self.data['tail 1']['y'][idx] < y_lower:
                         is_center[idx] = 1
+
+                        if idx > 0:
+                            if is_center[idx] != is_center[idx-1]:
+                                num_cross+=1
+                self.num_cross.append(num_cross)
 
             self.time_in_center = is_center
             self.cumu_time_center = []
@@ -218,6 +229,8 @@ class DLCData:
         # as well as a function of time
         distPlot = StartPlots()
         self.dist_center_bins = distPlot.ax.hist(self.dist_center, bins = np.linspace(0, 1200, 101))
+        self.dist_center_bins_30 = distPlot.ax.hist(self.dist_center[0:30*60*self.fps],
+                                                    bins = np.linspace(0,1200, 101))
         distPlot.ax.set_xlabel('Distance from center (px)')
         distPlot.ax.set_ylabel('Occurance')
         distPlot.save_plot('Distribution of distance from center.tiff', 'tiff', savefigpath)
@@ -292,88 +305,150 @@ class DLCData:
 
     def get_movement(self):
         # calculate distance, running velocity, acceleration, based on tail (base of tail)
-        self.vel = np.zeros((self.nFrames-1, 1))
-        self.dist = np.zeros((self.nFrames-1,1))
-        self.accel = np.zeros((self.nFrames-1, 1))
+        savedatapath = os.path.join(self.analysis,'movement.pickle')
+        if not os.path.exists(savedatapath):
+            self.vel = np.zeros((self.nFrames-1, 1))
+            self.dist = np.zeros((self.nFrames-1,1))
+            self.accel = np.zeros((self.nFrames-1, 1))
 
-        for ff in range(self.nFrames-1):
-            self.dist[ff] = np.sqrt((self.data['tail 1']['x'][ff+1] - self.data['tail 1']['x'][ff])**2 +
-                (self.data['tail 1']['y'][ff + 1] - self.data['tail 1']['y'][ff]) ** 2)
+            for ff in range(self.nFrames-1):
+                self.dist[ff] = np.sqrt((self.data['tail 1']['x'][ff+1] - self.data['tail 1']['x'][ff])**2 +
+                    (self.data['tail 1']['y'][ff + 1] - self.data['tail 1']['y'][ff]) ** 2)
 
-            self.vel[ff] = (self.dist[ff])*self.fps
-            if ff<self.nFrames-2:
-                self.accel[ff] = (self.vel[ff+1]-self.vel[ff])*self.fps
+                self.vel[ff] = (self.dist[ff])*self.fps
+                if ff<self.nFrames-2:
+                    self.accel[ff] = (self.vel[ff+1]-self.vel[ff])*self.fps
+            # save vel, dist, accel in pickle file
+            dist = self.dist
+            vel = self.vel
+            accel = self.accel
+            with open(savedatapath, 'wb') as f:
+                pickle.dump([dist, vel, accel], f)
+            f.close()
+        else:
+            # load dis, vel and accel from pickle file
+            with open(savedatapath, 'rb') as f:
+                self.dist, self.vel, self.accel = pickle.load(f)
+            f.close()
 
     def get_movement_running(self, t, savefigpath):
+        savedatapath = os.path.join(self.analysis, 'movement_running.pickle')
+        if not os.path.exists(savedatapath):
         # get average distance and velocity in running window of t seconds
-        self.vel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
-        self.dist_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
-        self.accel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+            self.vel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+            self.dist_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+            self.accel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
 
-        for ff in range(self.nFrames - 1 - t*self.fps):
-            self.dist_running[ff] = np.sum(self.dist[ff:ff+t*self.fps])
-            self.vel_running[ff] = np.nanmean(self.vel[ff:ff+t*self.fps])
-            self.accel_running[ff] = np.nanmean(self.accel[ff:ff+t*self.fps])
-            self.vel[ff] = (self.dist[ff]) * self.fps
+            for ff in range(self.nFrames - 1 - t*self.fps):
+                self.dist_running[ff] = np.sum(self.dist[ff:ff+t*self.fps])
+                self.vel_running[ff] = np.nanmean(self.vel[ff:ff+t*self.fps])
+                self.accel_running[ff] = np.nanmean(self.accel[ff:ff+t*self.fps])
+                self.vel[ff] = (self.dist[ff]) * self.fps
 
-        velPlot = StartPlots()
-        velPlot.ax.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.dist_running)
-        velPlot.ax.set_ylabel('Average distance traveled (px)')
-        #ax2 = velPlot.ax.twinx()
-        #ax2.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.vel_running, color='red')
-        #ax2.set_ylabel('Average velocity')
-        velPlot.ax.set_xlabel('Time (s)')
+            dist_running = self.dist_running
+            vel_running = self.vel_running
+            accel_running = self.accel_running
+            with open(savedatapath, 'wb') as f:
+                pickle.dump([dist_running, vel_running, accel_running], f)
+            f.close()
 
-        velPlot.save_plot('Running distance and velocity.tiff', 'tiff', savefigpath)
-        plt.close(velPlot.fig)
+            velPlot = StartPlots()
+            velPlot.ax.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.dist_running)
+            velPlot.ax.set_ylabel('Average distance traveled (px)')
+            #ax2 = velPlot.ax.twinx()
+            #ax2.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.vel_running, color='red')
+            #ax2.set_ylabel('Average velocity')
+            velPlot.ax.set_xlabel('Time (s)')
+
+            velPlot.save_plot('Running distance and velocity.png', 'png', savefigpath)
+            plt.close(velPlot.fig)
+        else:
+            # load dis, vel and accel from pickle file
+            with open(savedatapath, 'rb') as f:
+                self.dist_running, self.vel_running, self.accel_running = pickle.load(f)
+            f.close()
+
     def get_angular_velocity(self):
         # calculate angular velocity based on tail and spine 1
-        self.angVel = np.zeros((self.nFrames-1, 1))
-        for ff in range(self.nFrames-1):
-            y1 = self.data['spine 1']['y'][ff] - self.data['tail 1']['y'][ff]
-            x1 = self.data['spine 1']['x'][ff] - self.data['tail 1']['x'][ff]
+        savedatapath = os.path.join(self.analysis, 'angular_velocity.pickle')
+        if not os.path.exists(savedatapath):
+            self.angVel = np.zeros((self.nFrames-1, 1))
+            for ff in range(self.nFrames-1):
+                y1 = self.data['spine 1']['y'][ff] - self.data['tail 1']['y'][ff]
+                x1 = self.data['spine 1']['x'][ff] - self.data['tail 1']['x'][ff]
 
-            y2 = self.data['spine 1']['y'][ff+1] - self.data['tail 1']['y'][ff+1]
-            x2 = self.data['spine 1']['x'][ff+1] - self.data['tail 1']['x'][ff+1]
+                y2 = self.data['spine 1']['y'][ff+1] - self.data['tail 1']['y'][ff+1]
+                x2 = self.data['spine 1']['x'][ff+1] - self.data['tail 1']['x'][ff+1]
 
-            self.angVel[ff] = self.get_angle([x1, y1], [x2, y2])*self.fps
+                self.angVel[ff] = self.get_angle([x1, y1], [x2, y2])*self.fps
+            angVel = self.angVel
+            with open(savedatapath, 'wb') as f:
+                pickle.dump(angVel, f)
+            f.close()
+        else:
+            with open(savedatapath, 'rb') as f:
+                self.angVel = pickle.load(f)
+            f.close()
         #self.angVel = self.angVel*self.fps
 
     def get_head_angular_velocity(self):
-        self.headAngVel = np.zeros((self.nFrames, 1))
-        for ff in range(self.nFrames-1):
-            # get the mid point of two ears
-            midX1 = (self.data['left ear']['x'][ff] + self.data['right ear']['x'][ff])/2
-            midY1 = (self.data['left ear']['y'][ff] + self.data['right ear']['y'][ff])/2
+        savedatapath = os.path.join(self.analysis, 'head_angular_velocity.pickle')
+        if not os.path.exists(savedatapath):
+            self.headAngVel = np.zeros((self.nFrames, 1))
+            for ff in range(self.nFrames-1):
+                # get the mid point of two ears
+                midX1 = (self.data['left ear']['x'][ff] + self.data['right ear']['x'][ff])/2
+                midY1 = (self.data['left ear']['y'][ff] + self.data['right ear']['y'][ff])/2
 
-            midX2 = (self.data['left ear']['x'][ff+1] + self.data['right ear']['x'][ff+1])/2
-            midY2 = (self.data['left ear']['y'][ff+1] + self.data['right ear']['y'][ff+1])/2
+                midX2 = (self.data['left ear']['x'][ff+1] + self.data['right ear']['x'][ff+1])/2
+                midY2 = (self.data['left ear']['y'][ff+1] + self.data['right ear']['y'][ff+1])/2
 
-            v1 = [self.data['nose']['x'][ff]-midX1, self.data['nose']['y'][ff]-midY1]
-            v2 = [self.data['nose']['x'][ff+1]-midX2, self.data['nose']['y'][ff+1]-midY2]
+                v1 = [self.data['nose']['x'][ff]-midX1, self.data['nose']['y'][ff]-midY1]
+                v2 = [self.data['nose']['x'][ff+1]-midX2, self.data['nose']['y'][ff+1]-midY2]
 
-            self.headAngVel[ff] = self.get_angle(v1, v2) * self.fps
+                self.headAngVel[ff] = self.get_angle(v1, v2) * self.fps
+            with open(savedatapath, 'wb') as f:
+                pickle.dump(self.headAngVel, f)
+            f.close()
+        else:
+            with open(savedatapath, 'rb') as f:
+                self.headAngVel = pickle.load(f)
+            f.close()
+
 
     def get_angular_velocity_running(self, t, savefigpath):
         # calculate angular velocity with running window t
-        self.angVel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
-        self.headAngVel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+        savedatapath = os.path.join(self.analysis, 'angular_velocity_running.pickle')
 
-        for ff in range(self.nFrames - 1 - t*self.fps):
-            self.angVel_running[ff] = np.nanmean(self.angVel[ff:ff+t*self.fps])
-            self.headAngVel_running[ff] = np.nanmean(self.headAngVel[ff:ff+t*self.fps])
+        if not os.path.exists(savedatapath):
+            self.angVel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
+            self.headAngVel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
 
-        # plot the velocity here
-        angPlot = StartPlots()
-        angPlot.ax.plot(self.t[0:self.nFrames - 1 - t*self.fps], self.angVel_running)
-        angPlot.ax.set_ylabel('Angular velocity')
-        ax2 = angPlot.ax.twinx()
-        ax2.plot(self.t[0:self.nFrames - 1 - t*self.fps], self.headAngVel_running, color='red')
-        ax2.set_ylabel('Head angular velocity', color='red')
-        angPlot.ax.set_xlabel('Time (s)')
+            for ff in range(self.nFrames - 1 - t*self.fps):
+                self.angVel_running[ff] = np.nanmean(self.angVel[ff:ff+t*self.fps])
+                self.headAngVel_running[ff] = np.nanmean(self.headAngVel[ff:ff+t*self.fps])
 
-        angPlot.save_plot('Running angular vel.tiff', 'tiff', savefigpath)
-        plt.close(angPlot.fig)
+            # plot the velocity here
+            angPlot = StartPlots()
+            angPlot.ax.plot(self.t[0:self.nFrames - 1 - t*self.fps], self.angVel_running)
+            angPlot.ax.set_ylabel('Angular velocity')
+            ax2 = angPlot.ax.twinx()
+            ax2.plot(self.t[0:self.nFrames - 1 - t*self.fps], self.headAngVel_running, color='red')
+            ax2.set_ylabel('Head angular velocity', color='red')
+            angPlot.ax.set_xlabel('Time (s)')
+
+            angPlot.save_plot('Running angular vel.tiff', 'tiff', savefigpath)
+            plt.close(angPlot.fig)
+
+            angVel_running = self.angVel_running
+            headAngVel_running = self.headAngVel_running
+            with open (savedatapath, 'wb') as f:
+                pickle.dump([angVel_running,headAngVel_running], f)
+            f.close()
+        else:
+            with open(savedatapath, 'rb') as f:
+                self.angVel_running, self.headAngVel_running = pickle.load(f)
+            f.close()
 
     def get_angle(self, v1, v2):
         # get angle between two vectors
@@ -908,13 +983,16 @@ class DLCSummary:
         self.data = pd.DataFrame(self.animals, columns=['Animal'])
         DLC_results = []
         video = []
+        analysis = []
         for aa in self.animals:
             filePatternCSV = '*' + aa + '*.csv'
             filePatternVideo = '*' + aa + '*.mp4'
             DLC_results.append(glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")[0])
             video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[0])
+            analysis.append(os.path.join(self.analysisFolder, aa))
         self.data['CSV'] = DLC_results
         self.data['Video'] = video
+        self.data['AnalysisPath'] = analysis
         self.data['GeneBG'] = self.GeneBG
         self.data['Sex'] = self.Sex
         self.nSubjects = len(self.animals)
@@ -923,7 +1001,8 @@ class DLCSummary:
         for s in range(self.nSubjects):
             filePath = self.data['CSV'][s]
             videoPath = self.data['Video'][s]
-            dlc = DLCData(filePath, videoPath, fps)
+            analysisPath = self.data['AnalysisPath'][s]
+            dlc = DLCData(filePath, videoPath, analysisPath, fps)
             DLC_obj.append(dlc)
             if dlc.nFrames < minFrames:
                 minFrames = dlc.nFrames
@@ -935,6 +1014,17 @@ class DLCSummary:
         self.WTIdx = animalIdx[self.data['GeneBG'] == 'WT']
         self.MutIdx = animalIdx[np.logical_or(self.data['GeneBG'] == 'KO',
                                               self.data['GeneBG'] == 'Mut')]
+        # grouping the animals
+
+        if self.Sex[0]==np.nan: # if no sex info
+            nGroups = 1
+        else:
+            nGroups = 2
+
+
+        if nGroups==2:
+            self.maleIdx = np.where(self.data['Sex']=='M')[0]
+            self.femaleIdx = np.where(self.data['Sex']=='F')[0]
 
     def get_animalInfo(self, root_folder):
         animalInfoFile = os.path.join(root_folder, 'animalInfo.csv')
@@ -1011,130 +1101,185 @@ class DLCSummary:
         elif 'Mut' in np.unique(self.data['GeneBG']):
             mutLabel = 'Mut'
 
-        WTBoot = bootstrap(distanceMat[:, self.WTIdx], 1,
-                               distanceMat[:, self.WTIdx].shape[0], 500)
-        MutBoot = bootstrap(distanceMat[:, self.MutIdx], 1,
-                                distanceMat[:, self.MutIdx].shape[0],500)
+        # WTIdx = np.where(self.data['GeneBG'] == 'WT')[0]
+
+        # plot the result without considering sex info
+        # WTBoot = bootstrap(distanceMat[:, self.WTIdx], 1,
+        #                        distanceMat[:, self.WTIdx].shape[0], 500)
+        # MutBoot = bootstrap(distanceMat[:, self.MutIdx], 1,
+        #                         distanceMat[:, self.MutIdx].shape[0],500)
         WTColor = (255 / 255, 189 / 255, 53 / 255)
         MutColor = (63 / 255, 167 / 255, 150 / 255)
 
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Distance travelled (px)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Distance traveled.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Distance traveled.svg', 'svg', savefigpath)
+        #
+        # """velocity plot"""
+        # WTBoot = bootstrap(velocityDist[:, self.WTIdx], 1,
+        #                        velocityDist[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(velocityDist[:, self.MutIdx], 1,
+        #                         velocityDist[:, self.MutIdx].shape[0])
+        # velPlot = StartPlots()
+        # velPlot.ax.plot(velEdges, WTBoot['bootAve'], color=WTColor, label='WT')
+        # velPlot.ax.fill_between(velEdges, WTBoot['bootLow'],
+        #                             WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # velPlot.ax.plot(velEdges, MutBoot['bootAve'], color=MutColor, label='KO')
+        # velPlot.ax.fill_between(velEdges, MutBoot['bootLow'],
+        #                             MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # velPlot.ax.set_xlabel('Velocity (px/s)')
+        # velPlot.ax.set_ylabel('Velocity distribution (%)')
+        # velPlot.legend(['WT', 'KO'])
+        # velPlot.save_plot('Velocity distribution.tif', 'tif', savefigpath)
+        # velPlot.save_plot('Velocity distribution.svg', 'svg', savefigpath)
+        #
+        # """ plot angular velocity distribution"""
+        # WTBoot = bootstrap(angularDist[:, self.WTIdx], 1,
+        #                        angularDist[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(angularDist[:, self.MutIdx], 1,
+        #                         angularDist[:, self.MutIdx].shape[0])
+        #
+        # """angular velocity plot"""
+        # angPlot = StartPlots()
+        # angPlot.ax.plot(angEdges, WTBoot['bootAve'], color=WTColor, label='WT')
+        # angPlot.ax.fill_between(angEdges, WTBoot['bootLow'],
+        #                             WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # angPlot.ax.plot(angEdges, MutBoot['bootAve'], color=MutColor, label='Mut')
+        # angPlot.ax.fill_between(angEdges, MutBoot['bootLow'],
+        #                             MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # angPlot.ax.set_xlabel('Angular velocity (radian/s)')
+        # angPlot.ax.set_ylabel('Angular velocity distribution (%)')
+        # angPlot.legend(['WT', 'Mut'])
+        # angPlot.save_plot('Angular velocity distribution.tif', 'tif', savefigpath)
+        # angPlot.save_plot('Angular velocity distribution.svg', 'svg', savefigpath)
+        #
+        # """plot head angular velocity distribution"""
+        # WTBoot = bootstrap(headAngularDist[:, self.WTIdx], 1,
+        #                        headAngularDist[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(headAngularDist[:, self.MutIdx], 1,
+        #                         headAngularDist[:, self.MutIdx].shape[0])
+        #
+        # angPlot = StartPlots()
+        # angPlot.ax.plot(angEdges, WTBoot['bootAve'], color=WTColor, label='WT')
+        # angPlot.ax.fill_between(angEdges, WTBoot['bootLow'],
+        #                             WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # angPlot.ax.plot(angEdges, MutBoot['bootAve'], color=MutColor, label='Mut')
+        # angPlot.ax.fill_between(angEdges, MutBoot['bootLow'],
+        #                             MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # angPlot.ax.set_xlabel('Angular velocity(head) (radian/s)')
+        # angPlot.ax.set_ylabel('Angular velocity(head) distribution (%)')
+        # angPlot.legend(['WT', 'Mut'])
+        # angPlot.save_plot('Angular velocity(head) distribution.tif', 'tif', savefigpath)
+        # angPlot.save_plot('Angular velocity(head distribution.svg', 'svg', savefigpath)
+        #
+        #
+        # # distance and velocity in 5 mins running window
+        # WTBoot = bootstrap(runningAve_distance[:, self.WTIdx], 1,
+        #                        runningAve_distance[:, self.WTIdx].shape[0], 500)
+        # MutBoot = bootstrap(runningAve_distance[:, self.MutIdx], 1,
+        #                         runningAve_distance[:, self.MutIdx].shape[0],500)
+        #
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Running average distance travelled in 5 mins (px)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
+        #
+        # WTBoot = bootstrap(runningAve_velocity[:, self.WTIdx], 1,
+        #                        runningAve_velocity[:, self.WTIdx].shape[0], 500)
+        # MutBoot = bootstrap(runningAve_velocity[:, self.MutIdx], 1,
+        #                         runningAve_velocity[:, self.MutIdx].shape[0],500)
+        #
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Running average velocity in 5 mins (px)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
+        #
+        # plt.close('all')
+
+        # plot result separating male and female
+        for ss in ['male','female', 'allsex']:
+            # plot distance
+            self.plot_movement_results(distanceMat,self.plotT,savefigpath,
+                                       'Distance travelled', ss,
+                                       ['WT', 'Mut'],WTColor, MutColor)
+
+            self.plot_movement_results(velocityDist,velEdges,savefigpath,
+                                       'Velocity', ss,
+                                       ['WT', 'Mut'],WTColor, MutColor)
+            self.plot_movement_results(angularDist,angEdges,savefigpath,
+                                       'Angular velocity', ss,
+                                       ['WT', 'Mut'],WTColor, MutColor)
+            self.plot_movement_results(runningAve_distance,self.plotT,savefigpath,
+                                       'Distance running 5 mins', ss,
+                                       ['WT', 'Mut'],WTColor, MutColor)
+
+
+    def plot_movement_results(self, variableMat, plotT, savefigpath, label, group, leg,color1, color2):
+        if group =='male':
+        # if consider sex info
+            WTIdx = list(set(self.WTIdx) & set(self.maleIdx))
+            mutIdx = list(set(self.MutIdx) & set(self.maleIdx))
+        elif group == 'female':
+            WTIdx = list(set(self.WTIdx) & set(self.femaleIdx))
+            mutIdx = list(set(self.MutIdx) & set(self.femaleIdx))
+        elif group == 'allsex':
+            WTIdx = self.WTIdx
+            mutIdx = self.MutIdx
+        WTBoot = bootstrap(variableMat[:, WTIdx], 1,
+                               variableMat[:, WTIdx].shape[0], 500)
+        MutBoot = bootstrap(variableMat[:, mutIdx], 1,
+                                variableMat[:, mutIdx].shape[0],500)
+        WTColor = color1
+        MutColor = color2
+
         distPlot = StartPlots()
-        distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
-                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
-                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        distPlot.ax.plot(plotT, WTBoot['bootAve'], color=color1, label='WT')
+        distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
+                                     WTBoot['bootHigh'], color=color1, alpha=0.2, label='_nolegend_')
+        distPlot.ax.plot(plotT, MutBoot['bootAve'], color=color2, label='KO')
+        distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
+                                     MutBoot['bootHigh'], color=color2, alpha=0.2, label='_nolegend_')
         distPlot.ax.set_xlabel('Time (s)')
-        distPlot.ax.set_ylabel('Distance travelled (px)')
-        distPlot.legend(['WT', 'KO'])
+        title = label + ' ' + group
+        distPlot.ax.set_ylabel(title)
+        distPlot.legend(leg)
+        distPlot.ax.set_ylim(0, np.nanmax(variableMat))
         # save the plot
-        distPlot.save_plot('Distance traveled.tif', 'tif', savefigpath)
-        distPlot.save_plot('Distance traveled.svg', 'svg', savefigpath)
-
-        """velocity plot"""
-        WTBoot = bootstrap(velocityDist[:, self.WTIdx], 1,
-                               velocityDist[:, self.WTIdx].shape[0])
-        MutBoot = bootstrap(velocityDist[:, self.MutIdx], 1,
-                                velocityDist[:, self.MutIdx].shape[0])
-        velPlot = StartPlots()
-        velPlot.ax.plot(velEdges, WTBoot['bootAve'], color=WTColor, label='WT')
-        velPlot.ax.fill_between(velEdges, WTBoot['bootLow'],
-                                    WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        velPlot.ax.plot(velEdges, MutBoot['bootAve'], color=MutColor, label='KO')
-        velPlot.ax.fill_between(velEdges, MutBoot['bootLow'],
-                                    MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        velPlot.ax.set_xlabel('Velocity (px/s)')
-        velPlot.ax.set_ylabel('Velocity distribution (%)')
-        velPlot.legend(['WT', 'KO'])
-        velPlot.save_plot('Velocity distribution.tif', 'tif', savefigpath)
-        velPlot.save_plot('Velocity distribution.svg', 'svg', savefigpath)
-
-        """ plot angular velocity distribution"""
-        WTBoot = bootstrap(angularDist[:, self.WTIdx], 1,
-                               angularDist[:, self.WTIdx].shape[0])
-        MutBoot = bootstrap(angularDist[:, self.MutIdx], 1,
-                                angularDist[:, self.MutIdx].shape[0])
-
-        """angular velocity plot"""
-        angPlot = StartPlots()
-        angPlot.ax.plot(angEdges, WTBoot['bootAve'], color=WTColor, label='WT')
-        angPlot.ax.fill_between(angEdges, WTBoot['bootLow'],
-                                    WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        angPlot.ax.plot(angEdges, MutBoot['bootAve'], color=MutColor, label='Mut')
-        angPlot.ax.fill_between(angEdges, MutBoot['bootLow'],
-                                    MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        angPlot.ax.set_xlabel('Angular velocity (radian/s)')
-        angPlot.ax.set_ylabel('Angular velocity distribution (%)')
-        angPlot.legend(['WT', 'Mut'])
-        angPlot.save_plot('Angular velocity distribution.tif', 'tif', savefigpath)
-        angPlot.save_plot('Angular velocity distribution.svg', 'svg', savefigpath)
-
-        """plot head angular velocity distribution"""
-        WTBoot = bootstrap(headAngularDist[:, self.WTIdx], 1,
-                               headAngularDist[:, self.WTIdx].shape[0])
-        MutBoot = bootstrap(headAngularDist[:, self.MutIdx], 1,
-                                headAngularDist[:, self.MutIdx].shape[0])
-
-        angPlot = StartPlots()
-        angPlot.ax.plot(angEdges, WTBoot['bootAve'], color=WTColor, label='WT')
-        angPlot.ax.fill_between(angEdges, WTBoot['bootLow'],
-                                    WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        angPlot.ax.plot(angEdges, MutBoot['bootAve'], color=MutColor, label='Mut')
-        angPlot.ax.fill_between(angEdges, MutBoot['bootLow'],
-                                    MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        angPlot.ax.set_xlabel('Angular velocity(head) (radian/s)')
-        angPlot.ax.set_ylabel('Angular velocity(head) distribution (%)')
-        angPlot.legend(['WT', 'Mut'])
-        angPlot.save_plot('Angular velocity(head) distribution.tif', 'tif', savefigpath)
-        angPlot.save_plot('Angular velocity(head distribution.svg', 'svg', savefigpath)
-
-
-        # distance and velocity in 5 mins running window
-        WTBoot = bootstrap(runningAve_distance[:, self.WTIdx], 1,
-                               runningAve_distance[:, self.WTIdx].shape[0], 500)
-        MutBoot = bootstrap(runningAve_distance[:, self.MutIdx], 1,
-                                runningAve_distance[:, self.MutIdx].shape[0],500)
-
-        distPlot = StartPlots()
-        distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
-                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
-                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.set_xlabel('Time (s)')
-        distPlot.ax.set_ylabel('Running average distance travelled in 5 mins (px)')
-        distPlot.legend(['WT', 'KO'])
-        # save the plot
-        distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
-        distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
-
-        WTBoot = bootstrap(runningAve_velocity[:, self.WTIdx], 1,
-                               runningAve_velocity[:, self.WTIdx].shape[0], 500)
-        MutBoot = bootstrap(runningAve_velocity[:, self.MutIdx], 1,
-                                runningAve_velocity[:, self.MutIdx].shape[0],500)
-
-        distPlot = StartPlots()
-        distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
-                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
-                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.set_xlabel('Time (s)')
-        distPlot.ax.set_ylabel('Running average velocity in 5 mins (px)')
-        distPlot.legend(['WT', 'KO'])
-        # save the plot
-        distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
-        distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
-
-        plt.close('all')
-
+        distPlot.save_plot(title+'.png', 'png', savefigpath)
+        distPlot.save_plot(title+'.svg', 'svg', savefigpath)
+        plt.close()
     def center_analysis(self, savefigpath):
         centerMat = np.full((self.minFrames, self.nSubjects), np.nan)
         runningAve_center = np.full((self.minFrames, self.nSubjects), np.nan)
-
+        numCrossMat = np.full((self.minFrames, self.nSubjects), np.nan)
         plotT = np.arange(self.minFrames)/self.fps
         for idx, obj in enumerate(self.data['DLC_obj']):
             savefigFolder = os.path.join(self.analysisFolder, self.animals[idx])
@@ -1145,10 +1290,13 @@ class DLCSummary:
             t = 5*60
             obj.plot_distance_to_center(t, savefigFolder)
             centerMat[:,idx] = obj.cumu_time_center[0:self.minFrames]
+            numCrossMat[:, idx] = obj.num_cross[0:self.minFrames]
             if idx==0:
                 nbins = len(obj.dist_center_bins[1])
                 centerDistMat = np.full((nbins-1, self.nSubjects), np.nan)
+                centerDistMat30 = np.full((nbins - 1, self.nSubjects), np.nan)
             centerDistMat[:,idx] = obj.dist_center_bins[0]
+            centerDistMat30[:,idx] = obj.dist_center_bins_30[0]
 
             runningAve_center[0: len(obj.dist_center_running), idx]=obj.dist_center_running.flatten()
 
@@ -1161,6 +1309,103 @@ class DLCSummary:
                                 centerMat[:, self.MutIdx].shape[0])
         WTColor = (255 / 255, 189 / 255, 53 / 255)
         MutColor = (63 / 255, 167 / 255, 150 / 255)
+
+        binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:]) / 2
+
+        for ss in ['male','female','allsex']:
+            # # plot distance
+            # self.plot_movement_results(centerMat,plotT,savefigpath,
+            #                            'Time spent in the center', ss,
+            #                            ['WT', 'Mut'],WTColor, MutColor)
+            # self.plot_movement_results(centerDistMat,binX,savefigpath,
+            #                            'Distribution of distance from center', ss,
+            #                            ['WT', 'Mut'],WTColor, MutColor)
+            # self.plot_movement_results(centerDistMat30,binX,savefigpath,
+            #                            'Distribution of distance from center 30 mins', ss,
+            #                            ['WT', 'Mut'],WTColor, MutColor)
+            # self.plot_movement_results(runningAve_center,plotT,savefigpath,
+            #                            'Time spent in the center in running 5 mins windows', ss,
+            #                            ['WT', 'Mut'],WTColor, MutColor)
+            self.plot_movement_results(numCrossMat,plotT,savefigpath,
+                                       'Num of crossings', ss,
+                                       ['WT', 'Mut'],WTColor, MutColor)
+
+        # KS test
+        from scipy.stats import ks_2samp
+        WTMale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.maleIdx))]
+        MutMale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.maleIdx))]
+        WTFemale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.femaleIdx))]
+        MutFemale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.femaleIdx))]
+        # Assuming you have two arrays of data: data1 and data2
+        # Perform the KS test
+        statistic, p_value = ks_2samp(WTMaleBoot['bootAve'], MutMaleBoot['bootAve'])
+
+        from scipy.stats import permutation_test
+        res = permutation_test((WTMale.T,MutMale.T), ks_2samp)
+
+        # Print the test statistic and p-value
+        print("KS statistic:", statistic)
+        print("p-value:", p_value)
+        # two-way ANOVA for centerDistMat30
+        gene_anova_male = []
+        dist_anova_male = []
+        response_anova_male = []
+        subject_male = []
+        gene_anova_female = []
+        dist_anova_female = []
+        subject_female = []
+        response_anova_female = []
+
+        for t in range(len(self.GeneBG)):
+            for s in range(len(binX)):
+                if self.Sex[t] == 'M':
+                    response_anova_male.append(centerDistMat30[s,t])
+                    gene_anova_male.append(self.GeneBG[t])
+                    dist_anova_male.append(binX[s])
+                    subject_male.append(self.animals[t])
+                else:
+                    response_anova_female.append(centerDistMat30[s,t])
+                    gene_anova_female.append(self.GeneBG[t])
+                    dist_anova_female.append(binX[s])
+                    subject_female.append(self.animals[t])
+
+        anova_data = pd.DataFrame({'gene': gene_anova_male,
+                                   'dist': dist_anova_male,
+                                   'response': response_anova_male,
+                                   'subject': subject_male
+                                   })
+        model = ols('response ~ gene + dist + gene:dist', anova_data).fit()
+        anova_table = sm.stats.anova_lm(model, typ=3)
+        # print ANOVA table
+        print(anova_table)
+
+        # three way anova?
+        gene_anova = []
+        dist_anova = []
+        response_anova = []
+        subject = []
+        sex = []
+
+
+        for t in range(len(self.GeneBG)):
+            for s in range(len(binX)):
+                response_anova.append(centerDistMat30[s,t])
+                gene_anova.append(self.GeneBG[t])
+                dist_anova.append(binX[s])
+                subject.append(self.animals[t])
+                sex.append(self.Sex[t])
+
+        anova_data = pd.DataFrame({'gene': gene_anova,
+                                   'dist': dist_anova,
+                                   'response': response_anova,
+                                   'sex': sex,
+                                   'subject': subject
+                                   })
+        model = ols('response ~ gene + dist + sex + gene:dist + gene:sex + dist:sex + dist:sex:gene', anova_data).fit()
+        anova_table = sm.stats.anova_lm(model, typ=3)
+        # print ANOVA table
+        print(anova_table)
+
 
         distPlot = StartPlots()
         distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
@@ -1243,7 +1488,7 @@ if __name__ == "__main__":
     DLCSum = DLCSummary(root_dir, fps)
 
     # basic motor-related analysis
-    DLCSum.motion_analysis(savemotionpath)
+    #DLCSum.motion_analysis(savemotionpath)
     DLCSum.center_analysis(savemotionpath)
     # analysis to do
     # moving trace ( require user input to mark the open field area)
