@@ -27,11 +27,13 @@ import ast
 import pandas as pd
 import glob
 import pickle
+import re
 import numpy as np
 from matplotlib import pyplot as plt
 import imageio
 from natsort import natsorted
-import fitz
+from scipy.signal import spectrogram
+#import fitz
 #from PIL import Image
 
 from tqdm import tqdm
@@ -41,7 +43,7 @@ import matplotlib.gridspec as gridspec
 import matplotlib.animation as animation
 import matplotlib.ticker as ticker
 from tqdm import tqdm
-from utility_HW import bootstrap
+from utility_HW import bootstrap, butter_lowpass_filter
 import h5py
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
@@ -50,6 +52,7 @@ import subprocess as sp
 import multiprocessing
 import concurrent.futures
 import functools
+import seaborn as sns
 
 # todo:
 # 1. check the open field paper for related plots
@@ -64,6 +67,9 @@ class DLCData:
         # read data
         self.data = self.read_data()
         self.analysis = analysisPath
+        self.fieldSize = 40 # in centimeter, used to convert px to cm
+        if not os.path.exists(self.analysis):
+            os.makedirs(self.analysis)
         #self.video = self.read_video()
 
     def get_confidence(self, p_threshold, savefigpath):
@@ -148,7 +154,21 @@ class DLCData:
                 self.arena = {}
                 for key in tempdata.keys():
                     self.arena[key] = ast.literal_eval(tempdata[key].values[0])
+
+                # convert px to cm
+                # calculate the length of each side in pixels, get the average, then convert to cm
+        sideLength = []
+        arenaKeys = list(self.arena.keys())
+        for kidx in range(len(arenaKeys)):
+            key1 = arenaKeys[kidx]
+            if kidx < len(arenaKeys)-1:
+                key2 = arenaKeys[kidx + 1]
+            else:
+                key2 = arenaKeys[0]
+            sideLength.append(np.sqrt((self.arena[key1][0]-self.arena[key2][0])**2+
+                                              (self.arena[key1][1]-self.arena[key2][1])**2))
         # save the coordinates in analysis folder
+        self.px2cm = self.fieldSize/np.mean(sideLength)
 
         arena_x = [self.arena['upper left'][0], self.arena['upper right'][0],
                    self.arena['lower right'][0], self.arena['lower left'][0], self.arena['upper left'][0]]
@@ -170,6 +190,8 @@ class DLCData:
         self.dist_center = np.sqrt((np.array(self.data['tail 1']['x'])-self.center_point[0])**2 +
                                    (np.array(self.data['tail 1']['y'])-self.center_point[1])**2)
 
+        if hasattr(self, 'px2cm'):
+            self.dist_center = self.dist_center*self.px2cm
 
         tracePlot = StartPlots()
         tracePlot.ax.plot(arena_x, arena_y)
@@ -251,6 +273,7 @@ class DLCData:
         data = {}
         self.t = []
         with open(self.filePath) as csv_file:
+            print("Loading data from: " + self.filePath)
             csv_reader = csv.reader(csv_file)
             line_count = 0
             for row in csv_reader:
@@ -331,6 +354,11 @@ class DLCData:
                 self.dist, self.vel, self.accel = pickle.load(f)
             f.close()
 
+        if hasattr(self, 'px2cm'):
+            self.dist = self.dist*self.px2cm
+            self.vel = self.vel*self.px2cm
+            self.accel = self.accel*self.px2cm
+
     def get_movement_running(self, t, savefigpath):
         savedatapath = os.path.join(self.analysis, 'movement_running.pickle')
         if not os.path.exists(savedatapath):
@@ -367,6 +395,10 @@ class DLCData:
             with open(savedatapath, 'rb') as f:
                 self.dist_running, self.vel_running, self.accel_running = pickle.load(f)
             f.close()
+        if hasattr(self, 'px2cm'):
+            self.dist_running = self.dist_running*self.px2cm
+            self.vel_running= self.vel_running*self.px2cm
+            self.accel_running = self.accel_running*self.px2cm
 
     def get_angular_velocity(self):
         # calculate angular velocity based on tail and spine 1
@@ -415,6 +447,99 @@ class DLCData:
                 self.headAngVel = pickle.load(f)
             f.close()
 
+    def get_stride(self):
+        savedatapath = os.path.join(self.analysis, 'stride_freq.csv')
+        if not os.path.exists(savedatapath):
+            self.stride = np.zeros((self.nFrames, 2))  # distance between spine and left/right foot
+            for ff in range(self.nFrames):
+                self.stride[ff,0] = np.sqrt((self.data['spine']['x'][ff]-self.data['left foot']['x'][ff])**2 +
+                                            (self.data['spine']['y'][ff]-self.data['left foot']['y'][ff])**2)
+                self.stride[ff,1] = np.sqrt((self.data['spine']['x'][ff]-self.data['right foot']['x'][ff])**2+
+                                            (self.data['spine']['y'][ff]-self.data['right foot']['y'][ff])**2)
+            self.filtered_stride = self.stride
+            self.filtered_stride[:,0] = butter_lowpass_filter(self.stride[:,0], 10,self.fps,order=5)
+            self.filtered_stride[:,1] = butter_lowpass_filter(self.stride[:, 1], 10, self.fps, order=5)
+
+            f, t_spec, Sxx_left = spectrogram(self.filtered_stride[:,0], self.fps)
+            f, t_spec, Sxx_right = spectrogram(self.filtered_stride[:, 1], self.fps)
+            # Plot spectrogram
+
+            # generate some plots
+            fig = plt.figure(figsize=(20, 16))
+            plot_time = 10
+            # Subplot 1 (First row, spanning two columns)
+            ax1 = plt.subplot2grid((4, 2), (0, 0), colspan=2)
+            ax1.plot(self.t, self.filtered_stride[:,0])
+            ax1.plot(self.t, self.filtered_stride[:,1])
+            ax1.set_title('Distance between left/right foot and spine')
+
+            # Subplot 2 (Second row, first column)
+            ax2 = plt.subplot2grid((4, 2), (1, 0))
+            ax2.plot(self.t[0:plot_time *self.fps], self.filtered_stride[0:plot_time*self.fps,0])
+            ax2.plot(self.t[0:plot_time *self.fps], self.filtered_stride[0:plot_time *self.fps,1])
+            ax2.set_title('Distance between foot and spine in the first'+str(plot_time) + ' seconds')
+
+            # Subplot 3 (Second row, second column)
+            ax3 = plt.subplot2grid((4, 2), (1, 1))
+            ax3.plot(self.t[-plot_time  * self.fps:], self.filtered_stride[-plot_time  * self.fps:, 0])
+            ax3.plot(self.t[-plot_time  * self.fps:], self.filtered_stride[-plot_time  * self.fps:, 1])
+            ax3.set_title('Distance between foot and spine in the last' +str(plot_time) + ' seconds')
+
+            # Subplot 4 (Third row, first column)
+            ax4 = plt.subplot2grid((4, 2), (2, 0))
+            ax4.pcolormesh(t_spec, f[0:40], 10 * np.log10(Sxx_left[0:40,:]), shading='auto')
+            #ax4.colorbar(label='Power/Frequency (dB/Hz)')
+            ax4.set_ylabel('Frequency (Hz)')
+            ax4.set_title('Spectrogram of left stride')
+
+
+            # Subplot 5 (Third row, second column)
+            ax5 = plt.subplot2grid((4, 2), (2, 1))
+            ax5.pcolormesh(t_spec, f[0:40], 10 * np.log10(Sxx_right[0:40,:]), shading='auto')
+
+            ax5.set_title('Spectrogram of left stride')
+            ax5.set_title('Spectrogram of right stride')
+
+            timeStep = 5 # in second
+            nWindows = int(np.floor(self.t[-1]/timeStep))
+            corrCoeff = np.zeros((nWindows))
+            tAxis = np.zeros((nWindows))
+            # calculate the stride length
+            for nn in range(nWindows):
+                tStart = timeStep * nn * self.fps
+                tEnd = timeStep * (nn+1) * self.fps-1
+                corrCoeff[nn] = np.corrcoef(self.filtered_stride[tStart:tEnd,0], self.filtered_stride[tStart:tEnd,1])[0,1]
+                tAxis[nn] = timeStep*nn
+            corrCoeff_running = np.zeros((len(self.t)))
+            for idx,t in enumerate(self.t):
+                tMask = np.logical_and(self.t>t, self.t<t+timeStep)
+                corrCoeff_running[idx] = np.corrcoef(self.filtered_stride[tMask,0], self.filtered_stride[tMask,1])[0,1]
+
+            ax6 = plt.subplot2grid((4, 2), (3, 0), colspan=2)
+            ax6.plot(self.t, corrCoeff_running)
+            ax6.plot([0,self.t[-1]], [0,0], 'k--')
+            ax6.set_ylim([-1, 1])
+            ax6.set_title('Correlation coefficient between two legs')
+            ax6.set_xlabel('Time (s)')
+            plt.tight_layout()  # Adjust subplot parameters to give specified padding
+            plt.savefig(os.path.join(self.analysis,'Stide frequency analysis.png'), dpi=300)  # Save as PNG fil
+            #plt.show()
+            plt.close()
+
+            # cross correlation in 10 second window
+
+            # save data in csv
+            data = {'stride_left': self.stride[:,0],
+                    'stride_right': self.stride[:,1],
+                    'correlation': corrCoeff_running,
+                    'time': self.t}
+            dataDF = pd.DataFrame(data)
+            dataDF.to_csv(savedatapath)
+            # with open(savedatapath, 'wb') as f:
+            #     pickle.dump(self.stride, self. f)
+            # f.close()
+        else:
+            print("Analysis already done")
 
     def get_angular_velocity_running(self, t, savefigpath):
         # calculate angular velocity with running window t
@@ -459,6 +584,32 @@ class DLCData:
             if v1[0] * v2[1] - v1[1] * v2[0] < 0:
                 angle = -angle
             return angle
+
+    def plot_keypoints(self, nFrame):
+        bodyparts = self.data['bodyparts']
+        skeleton = [
+            ['nose', 'head'],
+            ['head', 'left ear'],
+            ['head', 'right ear'],
+            ['head', 'spine 1'],
+            ['spine 1', 'left hand'],
+            ['spine 1', 'right hand'],
+            ['spine 1', 'spine 2'],
+            ['spine 2', 'spine 3'],
+            ['spine 3', 'left foot'],
+            ['spine 3', 'right foot'],
+            ['spine 3', 'tail 1'],
+            ['tail 1', 'tail 2'],
+            ['tail 2', 'tail 3']
+        ]
+        image = read_video(self.videoPath, nFrame, ifgray=True)
+        plt.imshow(image)
+        for bd in bodyparts:
+            plt.scatter(self.data[bd]['x'][nFrame], self.data[bd]['y'][nFrame])
+        for sk in skeleton:
+            plt.plot([self.data[sk[0]]['x'][nFrame],self.data[sk[1]['x'][nFrame]]], [self.data[sk[0]]['y'][nFrame],self.data[sk[1]['y'][nFrame]]])
+
+        plt.show()
 
     def unit_vector(self, v):
         """ Returns the unit vector of the vector.  """
@@ -964,7 +1115,7 @@ class Moseq:
 class DLCSummary:
     """class to summarize DLC data and analysis"""
 
-    def __init__(self, root_folder, fps):
+    def __init__(self, root_folder, fps, groups,behavior):
         self.rootFolder = root_folder
         self.dataFolder = os.path.join(root_folder, 'Data')
         self.analysisFolder = os.path.join(root_folder, 'Analysis')
@@ -974,31 +1125,85 @@ class DLCSummary:
         self.GeneBG = output['geneBG']
         self.Sex = output['sex']
         self.fps = fps
-
+        self.behavior = behavior
+        self.nSessions = 0
         # make directories
         if not os.path.exists(self.analysisFolder):
             os.makedirs(self.analysisFolder)
         if not os.path.exists(self.sumFolder):
             os.makedirs(self.sumFolder)
-        self.data = pd.DataFrame(self.animals, columns=['Animal'])
+        #self.data = pd.DataFrame(self.animals, columns=['Animal'])
         DLC_results = []
         video = []
+        animalID = []
         analysis = []
-        for aa in self.animals:
-            filePatternCSV = '*' + aa + '*.csv'
+        GeneBGID = []
+        sessionID = []
+        sexID = []
+        for aidx,aa in enumerate(self.animals):
+            if self.behavior == "openfield":
+                filePatternCSV = '*' + aa + '_OF_*.csv'
+            elif self.behavior == "Rotarod":
+                filePatternCSV = '*' + aa + '*_Rotarod*.csv'
             filePatternVideo = '*' + aa + '*.mp4'
-            DLC_results.append(glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")[0])
-            video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[0])
-            analysis.append(os.path.join(self.analysisFolder, aa))
+            sessionPattern = r'_([0-9]{1,2})(?=DLC)'
+            csvfiles = glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")
+            if not csvfiles == []:
+                for ff in range(len(csvfiles)):
+                    DLC_results.append(csvfiles[ff])
+                    video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[ff])
+                    animalID.append(aa)
+                    if self.behavior == "Rotarod":
+                        matches = re.findall(sessionPattern, csvfiles[ff])
+                        analysis.append(os.path.join(self.analysisFolder, aa,matches[0]))
+                        sessionID.append(matches[0])
+                    else:
+                        analysis.append(os.path.join(self.analysisFolder, aa))
+                        sessionID.append(aa)
+                    GeneBGID.append(self.GeneBG[aidx])
+                    sexID.append(self.Sex[aidx])
+        DLC_results = []
+        video = []
+        animalID = []
+        analysis = []
+        GeneBGID = []
+        sessionID = []
+        sexID = []
+        for aidx,aa in enumerate(self.animals):
+            if self.behavior == "openfield":
+                filePatternCSV = '*' + aa + '_OF_*.csv'
+            elif self.behavior == "Rotarod":
+                filePatternCSV = '*' + aa + '*_Rotarod*.csv'
+            filePatternVideo = '*' + aa + '*.mp4'
+            sessionPattern = r'_([0-9]{1,2})(?=DLC)'
+            csvfiles = glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")
+            if not csvfiles == []:
+                for ff in range(len(csvfiles)):
+                    DLC_results.append(csvfiles[ff])
+                    video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[ff])
+                    animalID.append(aa)
+                    if self.behavior == "Rotarod":
+                        matches = re.findall(sessionPattern, csvfiles[ff])
+                        analysis.append(os.path.join(self.analysisFolder, aa,matches[0]))
+                        sessionID.append(matches[0])
+                    else:
+                        analysis.append(os.path.join(self.analysisFolder, aa))
+                        sessionID.append(aa)
+                    GeneBGID.append(self.GeneBG[aidx])
+                    sexID.append(self.Sex[aidx])
+
+        self.data = pd.DataFrame(animalID, columns=['Animal'])
         self.data['CSV'] = DLC_results
         self.data['Video'] = video
         self.data['AnalysisPath'] = analysis
-        self.data['GeneBG'] = self.GeneBG
-        self.data['Sex'] = self.Sex
+        self.data['GeneBG'] = GeneBGID
+        self.data['Sex'] = sexID
         self.nSubjects = len(self.animals)
+
+        self.nSessions = len(DLC_results)
         DLC_obj = []
         minFrames = 10 ** 8
-        for s in range(self.nSubjects):
+        for s in range(self.nSessions):
             filePath = self.data['CSV'][s]
             videoPath = self.data['Video'][s]
             analysisPath = self.data['AnalysisPath'][s]
@@ -1010,10 +1215,9 @@ class DLCSummary:
         self.minFrames = minFrames
         self.data['DLC_obj'] = DLC_obj
         self.plotT = np.arange(0, minFrames-1)/fps
-        animalIdx = np.arange(self.nSubjects)
-        self.WTIdx = animalIdx[self.data['GeneBG'] == 'WT']
-        self.MutIdx = animalIdx[np.logical_or(self.data['GeneBG'] == 'KO',
-                                              self.data['GeneBG'] == 'Mut')]
+        animalIdx = np.arange(self.nSessions)
+        self.WTIdx = animalIdx[self.data['GeneBG'] == groups[0]]
+        self.MutIdx = animalIdx[self.data['GeneBG'] == groups[1]]
         # grouping the animals
 
         if self.Sex[0]==np.nan: # if no sex info
@@ -1225,6 +1429,25 @@ class DLCSummary:
         # plt.close('all')
 
         # plot result separating male and female
+        # save distanceMat, runningAve_distance
+
+        # convert to cm
+        savedistPath = os.path.join(savefigpath, 'CumulativeDistance.csv')
+        data = {}
+        for idx,animal in enumerate(self.animals):
+            data[animal] = distanceMat[:,idx]
+        data['time'] = self.plotT
+        data = pd.DataFrame(data)
+        data.to_csv(savedistPath)
+
+        savedistPath = os.path.join(savefigpath, 'runningAverageDistance.csv')
+        data = {}
+        for idx,animal in enumerate(self.animals):
+            data[animal] = runningAve_distance[:,idx]
+        data['time'] = self.plotT
+        data = pd.DataFrame(data)
+        data.to_csv(savedistPath)
+
         for ss in ['male','female', 'allsex']:
             # plot distance
             self.plot_movement_results(distanceMat,self.plotT,savefigpath,
@@ -1241,6 +1464,12 @@ class DLCSummary:
                                        'Distance running 5 mins', ss,
                                        ['WT', 'Mut'],WTColor, MutColor)
 
+    def stride_analysis(self,savefigpath):
+        # stride analysis for rotarod behavior
+        #strideMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
+
+        for idx, obj in enumerate(self.data['DLC_obj']):
+            obj.get_stride()
 
     def plot_movement_results(self, variableMat, plotT, savefigpath, label, group, leg,color1, color2):
         if group =='male':
@@ -1254,9 +1483,9 @@ class DLCSummary:
             WTIdx = self.WTIdx
             mutIdx = self.MutIdx
         WTBoot = bootstrap(variableMat[:, WTIdx], 1,
-                               variableMat[:, WTIdx].shape[0], 500)
+                               variableMat[:, WTIdx].shape[0], 200)
         MutBoot = bootstrap(variableMat[:, mutIdx], 1,
-                                variableMat[:, mutIdx].shape[0],500)
+                                variableMat[:, mutIdx].shape[0],200)
         WTColor = color1
         MutColor = color2
 
@@ -1271,7 +1500,7 @@ class DLCSummary:
         title = label + ' ' + group
         distPlot.ax.set_ylabel(title)
         distPlot.legend(leg)
-        distPlot.ax.set_ylim(0, np.nanmax(variableMat))
+        #distPlot.ax.set_ylim(0, np.nanmax(variableMat))
         # save the plot
         distPlot.save_plot(title+'.png', 'png', savefigpath)
         distPlot.save_plot(title+'.svg', 'svg', savefigpath)
@@ -1300,169 +1529,200 @@ class DLCSummary:
 
             runningAve_center[0: len(obj.dist_center_running), idx]=obj.dist_center_running.flatten()
 
-
-        # save centerMat result
-
-        WTBoot = bootstrap(centerMat[:, self.WTIdx], 1,
-                               centerMat[:, self.WTIdx].shape[0])
-        MutBoot = bootstrap(centerMat[:, self.MutIdx], 1,
-                                centerMat[:, self.MutIdx].shape[0])
         WTColor = (255 / 255, 189 / 255, 53 / 255)
         MutColor = (63 / 255, 167 / 255, 150 / 255)
+        # save centerMat result
 
-        binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:]) / 2
+        # total time in the center
+        totalCenter = centerMat[-1,:]
+        totalCross = numCrossMat[-1,:]
+        # violin plot
+        custom_palette = {0: WTColor, 1: MutColor}
+        ax=sns.violinplot(data=[totalCenter[self.WTIdx], totalCenter[self.MutIdx]],palette=custom_palette)
+        ax.set_xticklabels(['WT', 'Mut'])
+        ax.set_ylabel('Total time in the center')
+        ax.set_xlabel('Group')
+        ax.set_title('Total time in the center')
+        plt.savefig(savefigpath + '\\violin_center_time.png', dpi=300)
+        plt.savefig(savefigpath + '\\violin_center_time.svg', dpi=300)
+        plt.close()
 
-        for ss in ['male','female','allsex']:
-            # # plot distance
-            # self.plot_movement_results(centerMat,plotT,savefigpath,
-            #                            'Time spent in the center', ss,
-            #                            ['WT', 'Mut'],WTColor, MutColor)
-            # self.plot_movement_results(centerDistMat,binX,savefigpath,
-            #                            'Distribution of distance from center', ss,
-            #                            ['WT', 'Mut'],WTColor, MutColor)
-            # self.plot_movement_results(centerDistMat30,binX,savefigpath,
-            #                            'Distribution of distance from center 30 mins', ss,
-            #                            ['WT', 'Mut'],WTColor, MutColor)
-            # self.plot_movement_results(runningAve_center,plotT,savefigpath,
-            #                            'Time spent in the center in running 5 mins windows', ss,
-            #                            ['WT', 'Mut'],WTColor, MutColor)
-            self.plot_movement_results(numCrossMat,plotT,savefigpath,
-                                       'Num of crossings', ss,
-                                       ['WT', 'Mut'],WTColor, MutColor)
+        ax=sns.violinplot(data=[totalCross[self.WTIdx], totalCross[self.MutIdx]],palette=custom_palette)
+        ax.set_xticklabels(['WT', 'Mut'])
+        ax.set_ylabel('Total cross time')
+        ax.set_xlabel('Group')
+        ax.set_title('Total cross time')
+        plt.savefig(savefigpath + '/violin_cross_time.png', dpi=300)
+        plt.savefig(savefigpath + '/violin_cross_time.svg', dpi=300)
+        plt.close()
+
+        data = {'animalID':self.animals,
+                'timeinCenter': totalCenter,
+                'crossTime': totalCross}
+        data = pd.DataFrame(data)
+        data.to_csv(savefigpath + '/timeinCenter.csv')
+
+        # WTBoot = bootstrap(centerMat[:, self.WTIdx], 1,
+        #                        centerMat[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(centerMat[:, self.MutIdx], 1,
+        #                         centerMat[:, self.MutIdx].shape[0])
+        # WTColor = (255 / 255, 189 / 255, 53 / 255)
+        # MutColor = (63 / 255, 167 / 255, 150 / 255)
+        #
+        # binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:]) / 2
+        #
+        # for ss in ['male','female','allsex']:
+        #     # plot distance
+        #     self.plot_movement_results(centerMat,plotT,savefigpath,
+        #                                'Time spent in the center', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
+        #     self.plot_movement_results(centerDistMat,binX,savefigpath,
+        #                                'Distribution of distance from center', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
+        #     self.plot_movement_results(centerDistMat30,binX,savefigpath,
+        #                                'Distribution of distance from center 30 mins', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
+        #     self.plot_movement_results(runningAve_center,plotT,savefigpath,
+        #                                'Time spent in the center in running 5 mins windows', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
+        #     self.plot_movement_results(numCrossMat,plotT,savefigpath,
+        #                                'Num of crossings', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
 
         # KS test
-        from scipy.stats import ks_2samp
-        WTMale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.maleIdx))]
-        MutMale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.maleIdx))]
-        WTFemale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.femaleIdx))]
-        MutFemale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.femaleIdx))]
-        # Assuming you have two arrays of data: data1 and data2
-        # Perform the KS test
-        statistic, p_value = ks_2samp(WTMaleBoot['bootAve'], MutMaleBoot['bootAve'])
-
-        from scipy.stats import permutation_test
-        res = permutation_test((WTMale.T,MutMale.T), ks_2samp)
-
-        # Print the test statistic and p-value
-        print("KS statistic:", statistic)
-        print("p-value:", p_value)
-        # two-way ANOVA for centerDistMat30
-        gene_anova_male = []
-        dist_anova_male = []
-        response_anova_male = []
-        subject_male = []
-        gene_anova_female = []
-        dist_anova_female = []
-        subject_female = []
-        response_anova_female = []
-
-        for t in range(len(self.GeneBG)):
-            for s in range(len(binX)):
-                if self.Sex[t] == 'M':
-                    response_anova_male.append(centerDistMat30[s,t])
-                    gene_anova_male.append(self.GeneBG[t])
-                    dist_anova_male.append(binX[s])
-                    subject_male.append(self.animals[t])
-                else:
-                    response_anova_female.append(centerDistMat30[s,t])
-                    gene_anova_female.append(self.GeneBG[t])
-                    dist_anova_female.append(binX[s])
-                    subject_female.append(self.animals[t])
-
-        anova_data = pd.DataFrame({'gene': gene_anova_male,
-                                   'dist': dist_anova_male,
-                                   'response': response_anova_male,
-                                   'subject': subject_male
-                                   })
-        model = ols('response ~ gene + dist + gene:dist', anova_data).fit()
-        anova_table = sm.stats.anova_lm(model, typ=3)
-        # print ANOVA table
-        print(anova_table)
-
-        # three way anova?
-        gene_anova = []
-        dist_anova = []
-        response_anova = []
-        subject = []
-        sex = []
-
-
-        for t in range(len(self.GeneBG)):
-            for s in range(len(binX)):
-                response_anova.append(centerDistMat30[s,t])
-                gene_anova.append(self.GeneBG[t])
-                dist_anova.append(binX[s])
-                subject.append(self.animals[t])
-                sex.append(self.Sex[t])
-
-        anova_data = pd.DataFrame({'gene': gene_anova,
-                                   'dist': dist_anova,
-                                   'response': response_anova,
-                                   'sex': sex,
-                                   'subject': subject
-                                   })
-        model = ols('response ~ gene + dist + sex + gene:dist + gene:sex + dist:sex + dist:sex:gene', anova_data).fit()
-        anova_table = sm.stats.anova_lm(model, typ=3)
-        # print ANOVA table
-        print(anova_table)
-
-
-        distPlot = StartPlots()
-        distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
-                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
-                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.set_xlabel('Time (s)')
-        distPlot.ax.set_ylabel('Time spent in the center (s)')
-        distPlot.legend(['WT', 'KO'])
-        # save the plot
-        distPlot.save_plot('Time spent in the center.tif', 'tif', savefigpath)
-        distPlot.save_plot('Time spent in the center.svg', 'svg', savefigpath)
-
-        # distribution of distance from center
-        WTBoot = bootstrap(centerDistMat[:, self.WTIdx], 1,
-                               centerDistMat[:, self.WTIdx].shape[0])
-        MutBoot = bootstrap(centerDistMat[:, self.MutIdx], 1,
-                                centerDistMat[:, self.MutIdx].shape[0])
-        binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:])/2
-        distPlot = StartPlots()
-        distPlot.ax.plot(binX, WTBoot['bootAve'], color=WTColor, label='WT')
-        distPlot.ax.fill_between(binX, WTBoot['bootLow'],
-                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.plot(binX, MutBoot['bootAve'], color=MutColor, label='KO')
-        distPlot.ax.fill_between(binX, MutBoot['bootLow'],
-                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.set_xlabel('Distance from center (px)')
-        distPlot.ax.set_ylabel('Number of frames')
-        distPlot.legend(['WT', 'KO'])
-        # save the plot
-        distPlot.save_plot('Distribution of distance from center.tif', 'tif', savefigpath)
-        distPlot.save_plot('Distribution of distance from center.svg', 'svg', savefigpath)
-
-        # plot average distance from center in running windows
-        WTBoot = bootstrap(runningAve_center[:, self.WTIdx], 1,
-                               runningAve_center[:, self.WTIdx].shape[0])
-        MutBoot = bootstrap(runningAve_center[:, self.MutIdx], 1,
-                                runningAve_center[:, self.MutIdx].shape[0])
-
-        distPlot = StartPlots()
-        distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
-                                     WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
-                                     MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        distPlot.ax.set_xlabel('Time (s)')
-        distPlot.ax.set_ylabel('Time spent in the center in running 5 mins windows (s)')
-        distPlot.legend(['WT', 'KO'])
-        # save the plot
-        distPlot.save_plot('Time spent in the center in running 5 mins windows.tif', 'tif', savefigpath)
-        distPlot.save_plot('Time spent in the center in running 5 mins windows.svg', 'svg', savefigpath)
+        # from scipy.stats import ks_2samp
+        # WTMale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.maleIdx))]
+        # MutMale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.maleIdx))]
+        # WTFemale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.femaleIdx))]
+        # MutFemale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.femaleIdx))]
+        # # Assuming you have two arrays of data: data1 and data2
+        # # Perform the KS test
+        # statistic, p_value = ks_2samp(WTMaleBoot['bootAve'], MutMaleBoot['bootAve'])
+        #
+        # from scipy.stats import permutation_test
+        # res = permutation_test((WTMale.T,MutMale.T), ks_2samp)
+        #
+        # # Print the test statistic and p-value
+        # print("KS statistic:", statistic)
+        # print("p-value:", p_value)
+        # # two-way ANOVA for centerDistMat30
+        # gene_anova_male = []
+        # dist_anova_male = []
+        # response_anova_male = []
+        # subject_male = []
+        # gene_anova_female = []
+        # dist_anova_female = []
+        # subject_female = []
+        # response_anova_female = []
+        #
+        # for t in range(len(self.GeneBG)):
+        #     for s in range(len(binX)):
+        #         if self.Sex[t] == 'M':
+        #             response_anova_male.append(centerDistMat30[s,t])
+        #             gene_anova_male.append(self.GeneBG[t])
+        #             dist_anova_male.append(binX[s])
+        #             subject_male.append(self.animals[t])
+        #         else:
+        #             response_anova_female.append(centerDistMat30[s,t])
+        #             gene_anova_female.append(self.GeneBG[t])
+        #             dist_anova_female.append(binX[s])
+        #             subject_female.append(self.animals[t])
+        #
+        # anova_data = pd.DataFrame({'gene': gene_anova_male,
+        #                            'dist': dist_anova_male,
+        #                            'response': response_anova_male,
+        #                            'subject': subject_male
+        #                            })
+        # model = ols('response ~ gene + dist + gene:dist', anova_data).fit()
+        # anova_table = sm.stats.anova_lm(model, typ=3)
+        # # print ANOVA table
+        # print(anova_table)
+        #
+        # # three way anova?
+        # gene_anova = []
+        # dist_anova = []
+        # response_anova = []
+        # subject = []
+        # sex = []
+        #
+        #
+        # for t in range(len(self.GeneBG)):
+        #     for s in range(len(binX)):
+        #         response_anova.append(centerDistMat30[s,t])
+        #         gene_anova.append(self.GeneBG[t])
+        #         dist_anova.append(binX[s])
+        #         subject.append(self.animals[t])
+        #         sex.append(self.Sex[t])
+        #
+        # anova_data = pd.DataFrame({'gene': gene_anova,
+        #                            'dist': dist_anova,
+        #                            'response': response_anova,
+        #                            'sex': sex,
+        #                            'subject': subject
+        #                            })
+        # model = ols('response ~ gene + dist + sex + gene:dist + gene:sex + dist:sex + dist:sex:gene', anova_data).fit()
+        # anova_table = sm.stats.anova_lm(model, typ=3)
+        # # print ANOVA table
+        # print(anova_table)
+        #
+        #
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Time spent in the center (s)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Time spent in the center.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Time spent in the center.svg', 'svg', savefigpath)
+        #
+        # # distribution of distance from center
+        # WTBoot = bootstrap(centerDistMat[:, self.WTIdx], 1,
+        #                        centerDistMat[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(centerDistMat[:, self.MutIdx], 1,
+        #                         centerDistMat[:, self.MutIdx].shape[0])
+        # binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:])/2
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(binX, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(binX, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(binX, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(binX, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Distance from center (px)')
+        # distPlot.ax.set_ylabel('Number of frames')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Distribution of distance from center.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Distribution of distance from center.svg', 'svg', savefigpath)
+        #
+        # # plot average distance from center in running windows
+        # WTBoot = bootstrap(runningAve_center[:, self.WTIdx], 1,
+        #                        runningAve_center[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(runningAve_center[:, self.MutIdx], 1,
+        #                         runningAve_center[:, self.MutIdx].shape[0])
+        #
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Time spent in the center in running 5 mins windows (s)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Time spent in the center in running 5 mins windows.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Time spent in the center in running 5 mins windows.svg', 'svg', savefigpath)
 
 if __name__ == "__main__":
-    root_dir = r'Z:\HongliWang\openfield\katie\openfield_Cnt2'
+    root_dir = r'Z:\HongliWang\openfield\Ahtesha\DLC_project'
+    #root_dir = r'Z:\HongliWang\openfield\Erin\openfield_MGRPR_cKO'
     dataFolder = os.path.join(root_dir,'Data')
     #animals = ['1795', '1804', '1805', '1825', '1827', '1829']
     #animals = ['M3', 'M4', 'M5', 'M6']
@@ -1484,12 +1744,16 @@ if __name__ == "__main__":
     # make these plot functions?
     # plot the cumulative distance traveled
     savemotionpath = os.path.join(root_dir, 'Summary', 'DLC')
-
-    DLCSum = DLCSummary(root_dir, fps)
+    groups = ['Ctrl', 'Exp']
+    behavior = 'openfield'
+    DLCSum = DLCSummary(root_dir, fps, groups,behavior)
 
     # basic motor-related analysis
-    #DLCSum.motion_analysis(savemotionpath)
+    #
     DLCSum.center_analysis(savemotionpath)
+    DLCSum.stride_analysis(savemotionpath)
+
+    DLCSum.motion_analysis(savemotionpath)
     # analysis to do
     # moving trace ( require user input to mark the open field area)
     # time spend in the center (same)
@@ -1498,14 +1762,14 @@ if __name__ == "__main__":
     tt=DLCSum.data['DLC_obj'][0].moving_trace(savefigpath)
     """ keypoint-moseq analysis"""
     # DLCSum.data['DLC_obj'][0].get_time_in_center()
-    moseqResults = r'D:\openfield_cntnap\Data\Moseq\results.h5'
+    moseqResults = r'Z:\HongliWang\Rotarod\Rotarod_DLC\Data\Moseq\results.h5'
     MoseqData = Moseq(root_dir)
 
     session = MoseqData.sessions[0]
-    fps = 40
-    savefigpath = os.path.join(root_dir, 'Analysis', 'DLC')
+    fps = 30
+    savefigpath = os.path.join(root_dir, 'Analysis', 'Moseq')
 
-    #MoseqData.get_syllables(DLCSum)
+    MoseqData.get_syllables(DLCSum)
     #MoseqData.load_syllable_plot(root_dir)
     MoseqData.tail_dist(DLCSum, savefigpath)
 

@@ -1,6 +1,9 @@
 # general utility function needed in data analysis
 import numpy as np
 import pandas as pd
+from scipy.signal import butter, filtfilt
+import numpy as np
+import matplotlib.pyplot as plt
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -55,6 +58,14 @@ def count_consecutive(listx):
             count1 = 0
 
     return maxConsec1
+
+
+def butter_lowpass_filter(data, cutoff_freq, fs, order=5):
+    nyquist_freq = 0.5 * fs
+    normal_cutoff = cutoff_freq / nyquist_freq
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    y = filtfilt(b, a, data)
+    return y
 
 if __name__ == "__main__":
     x = [1, 1, 1, 0, 0, 1, 0, 0, 1, 0,1, 1,1,1,1,0,1]
