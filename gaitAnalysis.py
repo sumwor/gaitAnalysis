@@ -32,7 +32,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 import imageio
 from natsort import natsorted
+import scipy
 from scipy.signal import spectrogram
+from scipy.io import loadmat
 #import fitz
 #from PIL import Image
 
@@ -43,7 +45,7 @@ import matplotlib.gridspec as gridspec
 import matplotlib.animation as animation
 import matplotlib.ticker as ticker
 from tqdm import tqdm
-from utility_HW import bootstrap, butter_lowpass_filter
+from utility_HW import *
 import h5py
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
@@ -53,6 +55,7 @@ import multiprocessing
 import concurrent.futures
 import functools
 import seaborn as sns
+import ruptures as rpt
 
 # todo:
 # 1. check the open field paper for related plots
@@ -447,19 +450,106 @@ class DLCData:
                 self.headAngVel = pickle.load(f)
             f.close()
 
-    def get_stride(self):
+    def get_stride(self, orient):
         savedatapath = os.path.join(self.analysis, 'stride_freq.csv')
         if not os.path.exists(savedatapath):
-            self.stride = np.zeros((self.nFrames, 2))  # distance between spine and left/right foot
-            for ff in range(self.nFrames):
-                self.stride[ff,0] = np.sqrt((self.data['spine']['x'][ff]-self.data['left foot']['x'][ff])**2 +
-                                            (self.data['spine']['y'][ff]-self.data['left foot']['y'][ff])**2)
-                self.stride[ff,1] = np.sqrt((self.data['spine']['x'][ff]-self.data['right foot']['x'][ff])**2+
-                                            (self.data['spine']['y'][ff]-self.data['right foot']['y'][ff])**2)
-            self.filtered_stride = self.stride
-            self.filtered_stride[:,0] = butter_lowpass_filter(self.stride[:,0], 10,self.fps,order=5)
-            self.filtered_stride[:,1] = butter_lowpass_filter(self.stride[:, 1], 10, self.fps, order=5)
 
+            # define rod plane first
+            if orient == 'back':
+                left_key = 'left rod b'
+                right_key = 'right rod b'
+            elif orient == 'front':
+                left_key = 'rod left'
+                right_key = 'rod right'
+
+            frame = read_video(self.videoPath, 0, ifgray=False)
+            # overlay the video frame?
+            plt.imshow(frame)
+            plt.scatter(self.data[left_key]['x'], self.data[left_key]['y'],
+                        c=self.data[left_key]['p'], cmap='viridis', s=100)
+
+            # Add color bar to show the scale of likelihood
+            plt.colorbar(label='Confidence')
+
+            plt.scatter(self.data[right_key]['x'], self.data[right_key]['y'],
+                        c=self.data[right_key]['p'], cmap='viridis', s=100)
+
+            # get average from keypoints with confidence higher than 95%
+            ave_left_rod = np.array([np.mean(np.array(self.data[left_key]['x'])[np.array(self.data[left_key]['p'])>0.95]),
+                            np.mean(np.array(self.data[left_key]['y'])[np.array(self.data[left_key]['p'])>0.95])])
+            ave_right_rod = np.array([np.mean(np.array(self.data[right_key]['x'])[np.array(self.data[right_key]['p'])>0.95]),
+                            np.mean(np.array(self.data[right_key]['y'])[np.array(self.data[right_key]['p'])>0.95])])
+            ave_center_rod = (ave_left_rod+ave_right_rod)/2
+            self.data['left_rod'] = ave_left_rod
+            self.data['right_rod'] = ave_right_rod
+            self.data['center_rod'] = ave_center_rod
+
+            plt.scatter(ave_left_rod[0],ave_left_rod[1], s=200)
+            plt.scatter(ave_right_rod[0], ave_right_rod[1], s=200)
+            plt.scatter(ave_center_rod[0], ave_center_rod[1], s=200)
+            savefigpath = os.path.join(self.analysis)
+            if not os.path.exists(savefigpath):
+                os.makedirs(savefigpath)
+            plt.savefig(os.path.join(savefigpath,
+                                     'Rod coordinate' + orient + '.png'))
+            plt.close()
+            # save the figure
+
+            # remove unreliable frames (mostly because the animal turned around)
+            # average confidence
+            p_thresh = 0.7
+            if orient == 'front':
+                p_sum = np.array(self.data[self.data['bodyparts'][0]]['p'])
+                for kp in self.data['bodyparts']:
+                    if kp not in [left_key, right_key, self.data['bodyparts'][0], 'left paw',
+                                  'right paw']:
+                        print(kp)
+                        p_sum = p_sum + np.array(self.data[kp]['p'])
+                p_mean = p_sum/(len(self.data['bodyparts'])-4)
+                p_mask = p_mean >= p_thresh
+
+            # USE FRONT view, only keep data with mean p_value larger than 0.7?
+            # define stride based on the center point
+ # distance of left limb, right limb, and tail 1
+            if orient == 'back':
+                kp_list = ['left foot', 'right foot', 'tail 1']
+            elif orient == 'front':
+                kp_list = ['left paw', 'right paw', 'spine 1']
+
+                # cut the data to only include rod running period
+            startTime = 0
+            # we know when the animal fell - need to get that part of the data
+
+            endTime = min(300, self.data['aligned_t'][-1])
+            timeMask = np.logical_and(self.data['aligned_t']>=startTime, self.data['aligned_t']<= endTime)
+            nFramesInclude = np.sum(timeMask)
+            time_include = self.data['aligned_t'][timeMask]
+            self.stride = np.full((nFramesInclude, len(kp_list)), np.nan)
+
+            dataMask = np.logical_and(timeMask, p_mask)
+            self.notnanChunks = {}  # save the indices of not nan chunks in the stride for later filtering
+            for idx,kp in enumerate(kp_list):
+                self.stride[:,idx] = np.sqrt((np.array(self.data[kp]['x'])[timeMask]-ave_center_rod[0])**2 +
+                                            (np.array(self.data[kp]['y'])[timeMask]-ave_center_rod[1])**2)
+                tempMask = ~p_mask[timeMask]
+                self.stride[tempMask,idx] = np.nan
+                tempStride, tempIdx = fill_nans_and_split(self.stride[:, idx])
+                # interpolate the nans
+                self.notnanChunks[kp] = tempIdx
+                for ich, chunk in enumerate(tempIdx):
+                    self.stride[chunk[0]:chunk[1]+1,idx] = tempStride[ich]
+
+
+            self.filtered_stride = np.full((nFramesInclude, len(kp_list)), np.nan)
+
+            # need to determine the cutoff frequency here
+            for idx, kp in enumerate(kp_list):
+                for ich, chunk in enumerate(self.notnanChunks[kp]):
+                    if chunk[1]-chunk[0]+1 > 18:  # padlen
+                        self.filtered_stride[chunk[0]:chunk[1]+1,idx] = butter_lowpass_filter(self.stride[chunk[0]:chunk[1]+1,idx], 5,self.fps,order=5)
+
+
+            # worrying about it later - may be deal with chunks similarly as low-pass-filter
             f, t_spec, Sxx_left = spectrogram(self.filtered_stride[:,0], self.fps)
             f, t_spec, Sxx_right = spectrogram(self.filtered_stride[:, 1], self.fps)
             # Plot spectrogram
@@ -469,25 +559,25 @@ class DLCData:
             plot_time = 10
             # Subplot 1 (First row, spanning two columns)
             ax1 = plt.subplot2grid((4, 2), (0, 0), colspan=2)
-            ax1.plot(self.t, self.filtered_stride[:,0])
-            ax1.plot(self.t, self.filtered_stride[:,1])
+            ax1.plot(time_include , self.filtered_stride[:,0])
+            ax1.plot(time_include , self.filtered_stride[:,1])
             ax1.set_title('Distance between left/right foot and spine')
 
             # Subplot 2 (Second row, first column)
             ax2 = plt.subplot2grid((4, 2), (1, 0))
-            ax2.plot(self.t[0:plot_time *self.fps], self.filtered_stride[0:plot_time*self.fps,0])
-            ax2.plot(self.t[0:plot_time *self.fps], self.filtered_stride[0:plot_time *self.fps,1])
+            ax2.plot(time_include [0:plot_time *self.fps], self.filtered_stride[0:plot_time*self.fps,0])
+            ax2.plot(time_include [0:plot_time *self.fps], self.filtered_stride[0:plot_time *self.fps,1])
             ax2.set_title('Distance between foot and spine in the first'+str(plot_time) + ' seconds')
 
             # Subplot 3 (Second row, second column)
             ax3 = plt.subplot2grid((4, 2), (1, 1))
-            ax3.plot(self.t[-plot_time  * self.fps:], self.filtered_stride[-plot_time  * self.fps:, 0])
-            ax3.plot(self.t[-plot_time  * self.fps:], self.filtered_stride[-plot_time  * self.fps:, 1])
+            ax3.plot(time_include [-plot_time  * self.fps:], self.filtered_stride[-plot_time  * self.fps:, 0])
+            ax3.plot(time_include [-plot_time  * self.fps:], self.filtered_stride[-plot_time  * self.fps:, 1])
             ax3.set_title('Distance between foot and spine in the last' +str(plot_time) + ' seconds')
 
             # Subplot 4 (Third row, first column)
             ax4 = plt.subplot2grid((4, 2), (2, 0))
-            ax4.pcolormesh(t_spec, f[0:40], 10 * np.log10(Sxx_left[0:40,:]), shading='auto')
+            ax4.pcolormesh(t_spec, f[0:40], 5 * np.log10(Sxx_left[0:40,:]), shading='auto')
             #ax4.colorbar(label='Power/Frequency (dB/Hz)')
             ax4.set_ylabel('Frequency (Hz)')
             ax4.set_title('Spectrogram of left stride')
@@ -495,13 +585,13 @@ class DLCData:
 
             # Subplot 5 (Third row, second column)
             ax5 = plt.subplot2grid((4, 2), (2, 1))
-            ax5.pcolormesh(t_spec, f[0:40], 10 * np.log10(Sxx_right[0:40,:]), shading='auto')
+            ax5.pcolormesh(t_spec, f[0:40], 5 * np.log10(Sxx_right[0:40,:]), shading='auto')
 
             ax5.set_title('Spectrogram of left stride')
             ax5.set_title('Spectrogram of right stride')
 
             timeStep = 5 # in second
-            nWindows = int(np.floor(self.t[-1]/timeStep))
+            nWindows = int(np.floor(time_include[-1]/timeStep))
             corrCoeff = np.zeros((nWindows))
             tAxis = np.zeros((nWindows))
             # calculate the stride length
@@ -510,14 +600,14 @@ class DLCData:
                 tEnd = timeStep * (nn+1) * self.fps-1
                 corrCoeff[nn] = np.corrcoef(self.filtered_stride[tStart:tEnd,0], self.filtered_stride[tStart:tEnd,1])[0,1]
                 tAxis[nn] = timeStep*nn
-            corrCoeff_running = np.zeros((len(self.t)))
-            for idx,t in enumerate(self.t):
-                tMask = np.logical_and(self.t>t, self.t<t+timeStep)
+            corrCoeff_running = np.zeros((len(time_include )))
+            for idx,t in enumerate(time_include ):
+                tMask = np.logical_and(time_include >t, time_include <t+timeStep)
                 corrCoeff_running[idx] = np.corrcoef(self.filtered_stride[tMask,0], self.filtered_stride[tMask,1])[0,1]
 
             ax6 = plt.subplot2grid((4, 2), (3, 0), colspan=2)
-            ax6.plot(self.t, corrCoeff_running)
-            ax6.plot([0,self.t[-1]], [0,0], 'k--')
+            ax6.plot(time_include , corrCoeff_running)
+            ax6.plot([0,time_include[-1]], [0,0], 'k--')
             ax6.set_ylim([-1, 1])
             ax6.set_title('Correlation coefficient between two legs')
             ax6.set_xlabel('Time (s)')
@@ -538,9 +628,19 @@ class DLCData:
             # with open(savedatapath, 'wb') as f:
             #     pickle.dump(self.stride, self. f)
             # f.close()
+
+            if orient == "front":
+                return p_mask
+            else:
+                return np.nan
         else:
             print("Analysis already done")
+            return np.nan
 
+    def get_result(self):
+        # go over the behavior result and get time before fell
+        x=1
+        rodData = read_rotarod_csv()
     def get_angular_velocity_running(self, t, savefigpath):
         # calculate angular velocity with running window t
         savedatapath = os.path.join(self.analysis, 'angular_velocity_running.pickle')
@@ -1133,102 +1233,7 @@ class DLCSummary:
         if not os.path.exists(self.sumFolder):
             os.makedirs(self.sumFolder)
         #self.data = pd.DataFrame(self.animals, columns=['Animal'])
-        DLC_results = []
-        video = []
-        animalID = []
-        analysis = []
-        GeneBGID = []
-        sessionID = []
-        sexID = []
-        for aidx,aa in enumerate(self.animals):
-            if self.behavior == "openfield":
-                filePatternCSV = '*' + aa + '_OF_*.csv'
-            elif self.behavior == "Rotarod":
-                filePatternCSV = '*' + aa + '*_Rotarod*.csv'
-            filePatternVideo = '*' + aa + '*.mp4'
-            sessionPattern = r'_([0-9]{1,2})(?=DLC)'
-            csvfiles = glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")
-            if not csvfiles == []:
-                for ff in range(len(csvfiles)):
-                    DLC_results.append(csvfiles[ff])
-                    video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[ff])
-                    animalID.append(aa)
-                    if self.behavior == "Rotarod":
-                        matches = re.findall(sessionPattern, csvfiles[ff])
-                        analysis.append(os.path.join(self.analysisFolder, aa,matches[0]))
-                        sessionID.append(matches[0])
-                    else:
-                        analysis.append(os.path.join(self.analysisFolder, aa))
-                        sessionID.append(aa)
-                    GeneBGID.append(self.GeneBG[aidx])
-                    sexID.append(self.Sex[aidx])
-        DLC_results = []
-        video = []
-        animalID = []
-        analysis = []
-        GeneBGID = []
-        sessionID = []
-        sexID = []
-        for aidx,aa in enumerate(self.animals):
-            if self.behavior == "openfield":
-                filePatternCSV = '*' + aa + '_OF_*.csv'
-            elif self.behavior == "Rotarod":
-                filePatternCSV = '*' + aa + '*_Rotarod*.csv'
-            filePatternVideo = '*' + aa + '*.mp4'
-            sessionPattern = r'_([0-9]{1,2})(?=DLC)'
-            csvfiles = glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")
-            if not csvfiles == []:
-                for ff in range(len(csvfiles)):
-                    DLC_results.append(csvfiles[ff])
-                    video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[ff])
-                    animalID.append(aa)
-                    if self.behavior == "Rotarod":
-                        matches = re.findall(sessionPattern, csvfiles[ff])
-                        analysis.append(os.path.join(self.analysisFolder, aa,matches[0]))
-                        sessionID.append(matches[0])
-                    else:
-                        analysis.append(os.path.join(self.analysisFolder, aa))
-                        sessionID.append(aa)
-                    GeneBGID.append(self.GeneBG[aidx])
-                    sexID.append(self.Sex[aidx])
 
-        self.data = pd.DataFrame(animalID, columns=['Animal'])
-        self.data['CSV'] = DLC_results
-        self.data['Video'] = video
-        self.data['AnalysisPath'] = analysis
-        self.data['GeneBG'] = GeneBGID
-        self.data['Sex'] = sexID
-        self.nSubjects = len(self.animals)
-
-        self.nSessions = len(DLC_results)
-        DLC_obj = []
-        minFrames = 10 ** 8
-        for s in range(self.nSessions):
-            filePath = self.data['CSV'][s]
-            videoPath = self.data['Video'][s]
-            analysisPath = self.data['AnalysisPath'][s]
-            dlc = DLCData(filePath, videoPath, analysisPath, fps)
-            DLC_obj.append(dlc)
-            if dlc.nFrames < minFrames:
-                minFrames = dlc.nFrames
-
-        self.minFrames = minFrames
-        self.data['DLC_obj'] = DLC_obj
-        self.plotT = np.arange(0, minFrames-1)/fps
-        animalIdx = np.arange(self.nSessions)
-        self.WTIdx = animalIdx[self.data['GeneBG'] == groups[0]]
-        self.MutIdx = animalIdx[self.data['GeneBG'] == groups[1]]
-        # grouping the animals
-
-        if self.Sex[0]==np.nan: # if no sex info
-            nGroups = 1
-        else:
-            nGroups = 2
-
-
-        if nGroups==2:
-            self.maleIdx = np.where(self.data['Sex']=='M')[0]
-            self.femaleIdx = np.where(self.data['Sex']=='F')[0]
 
     def get_animalInfo(self, root_folder):
         animalInfoFile = os.path.join(root_folder, 'animalInfo.csv')
@@ -1464,12 +1469,6 @@ class DLCSummary:
                                        'Distance running 5 mins', ss,
                                        ['WT', 'Mut'],WTColor, MutColor)
 
-    def stride_analysis(self,savefigpath):
-        # stride analysis for rotarod behavior
-        #strideMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
-
-        for idx, obj in enumerate(self.data['DLC_obj']):
-            obj.get_stride()
 
     def plot_movement_results(self, variableMat, plotT, savefigpath, label, group, leg,color1, color2):
         if group =='male':
@@ -1720,8 +1719,304 @@ class DLCSummary:
         # distPlot.save_plot('Time spent in the center in running 5 mins windows.tif', 'tif', savefigpath)
         # distPlot.save_plot('Time spent in the center in running 5 mins windows.svg', 'svg', savefigpath)
 
+class DLC_OF(DLCSummary):
+    def __init__(self, root_folder, fps, groups,behavior):
+        super().__init__(root_folder, fps, groups,behavior)  # Call the parent class's __init__ method
+        DLC_results = []
+        video = []
+        animalID = []
+        analysis = []
+        GeneBGID = []
+        sessionID = []
+        sexID = []
+        for aidx,aa in enumerate(self.animals):
+            sessionPattern = r'_([0-9]{1,2})(?=DLC)'
+            filePatternCSV = '*' + aa + '_OF_*.csv'
+            filePatternVideo = '*' + aa + '*.mp4'
+            csvfiles = glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")
+            if not csvfiles == []:
+                for ff in range(len(csvfiles)):
+                    DLC_results.append(csvfiles[ff])
+                    video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[ff])
+                    animalID.append(aa)
+
+                    analysis.append(os.path.join(self.analysisFolder, aa))
+                    sessionID.append(aa)
+                    GeneBGID.append(self.GeneBG[aidx])
+                    sexID.append(self.Sex[aidx])
+
+        self.data = pd.DataFrame(animalID, columns=['Animal'])
+        self.data['CSV'] = DLC_results
+        self.data['Video'] = video
+
+        self.data['AnalysisPath'] = analysis
+        self.data['GeneBG'] = GeneBGID
+        self.data['Sex'] = sexID
+        self.nSubjects = len(self.animals)
+
+        self.nSessions = len(self.data['Animal'])
+        DLC_obj = []
+
+        minFrames = 10 ** 8
+        for s in range(self.nSessions):
+            analysisPath = self.data['AnalysisPath'][s]
+            filePath = self.data['CSV'][s]
+            videoPath = self.data['Video'][s]
+            dlc = DLCData(filePath, videoPath, analysisPath, fps)
+            DLC_obj.append(dlc)
+            if dlc.nFrames < minFrames:
+                minFrames = dlc.nFrames
+
+        self.minFrames = minFrames
+        self.data['DLC_obj'] = DLC_obj
+        self.plotT = np.arange(0, minFrames-1)/fps
+        animalIdx = np.arange(self.nSessions)
+        self.WTIdx = animalIdx[self.data['GeneBG'] == groups[0]]
+        self.MutIdx = animalIdx[self.data['GeneBG'] == groups[1]]
+        # grouping the animals
+
+        if self.Sex[0]==np.nan: # if no sex info
+            nGroups = 1
+        else:
+            nGroups = 2
+
+
+        if nGroups==2:
+            self.maleIdx = np.where(self.data['Sex']=='M')[0]
+            self.femaleIdx = np.where(self.data['Sex']=='F')[0]
+
+class DLC_Rotarod(DLCSummary):
+
+    def __init__(self, root_folder, fps, groups,behavior):
+        super().__init__(root_folder, fps, groups,behavior)  # Call the parent class's __init__ method
+
+        DLC_results = {}
+        video = {}
+        DLC_results['back'] = []
+        DLC_results['front'] = []
+        stage = []
+        Rod_speed = []
+        video['back'] = []
+        video['front'] = []
+        animalID = []
+        analysis = []
+        GeneBGID = []
+        sessionID = []
+        sexID = []
+        for aidx,aa in enumerate(self.animals):
+
+            sessionPattern = r'_([0-9]{1,2})(?=DLC)'
+
+            filePatternCSV = '*' + aa + '*_Rotarod*.csv'
+            filePatternVideo = '*' + aa + '*.avi'
+            filePatternMat = '*' + aa + '*.mat'
+            tempDLC = {}
+            tempVideo = {}
+            tempMat = []
+            for orient in ['back', 'front']:
+                tempDLC[orient] = glob.glob(f"{dataFolder}/{'DLC'}/{orient}/{filePatternCSV}")
+                tempVideo[orient] = glob.glob(f"{dataFolder}/{'Videos'}/{orient}/{filePatternVideo}")
+            tempMat = glob.glob(f"{dataFolder}/{'Speed'}/{filePatternMat}")
+            num_files = max(len(tempDLC['back']), len(tempDLC['front']))
+            if num_files>0:
+
+                for ff in range(num_files):
+                    DLC_results['back'].append(tempDLC['back'][ff])
+                    # match the sessions
+                    dateExpr = r'Rotarod_(\d+?)_'
+                    matches = re.findall(dateExpr, tempDLC['back'][ff])
+                    # in tempVideo['back'], find the string that has matches
+                    video_ID = [ID for ID in range(len(tempVideo['back'])) if matches[0] in tempVideo['back'][ID]]
+                    video['back'].append(tempVideo['back'][video_ID[0]])
+                    DLC_ID = [ID for ID in range(len(tempDLC['front'])) if matches[0] in tempDLC['front'][ID]]
+                    DLC_results['front'].append(tempDLC['front'][DLC_ID[0]])
+                    video_ID = [ID for ID in range(len(tempVideo['front'])) if matches[0] in tempVideo['front'][ID]]
+                    video['front'].append(tempVideo['front'][video_ID[0]])
+                    speed_ID = [ID for ID in range(len(tempMat)) if matches[0] in tempMat[ID]]
+                    Rod_speed.append(tempMat[speed_ID[0]])
+                    animalID.append(aa)
+                    matches = re.findall(sessionPattern, tempDLC['back'][ff])
+                    #stage.append(matches[0])
+                    analysis.append(os.path.join(self.analysisFolder, aa, matches[0]))
+                    sessionID.append(int(matches[0]))
+
+                    GeneBGID.append(self.GeneBG[aidx])
+                    sexID.append(self.Sex[aidx])
+
+        self.data = pd.DataFrame(animalID, columns=['Animal'])
+        for orient in ['back', 'front']:
+            self.data['CSV_'+orient] = DLC_results[orient]
+            self.data['Video_'+orient] = video[orient]
+            self.data['Rod_speed'] = Rod_speed
+        self.data['AnalysisPath'] = analysis
+        self.data['GeneBG'] = GeneBGID
+        self.data['Sex'] = sexID
+        self.data['Trial'] = sessionID
+        self.nSubjects = len(self.animals)
+        sorted_df = self.data.sort_values(by=['Animal', 'Trial'])
+        sorted_df = sorted_df.reset_index(drop=True)
+        self.data=sorted_df
+        self.nSessions = len(self.data['Animal'])
+
+        DLC_obj = {}
+        DLC_obj['back'] = []
+        DLC_obj['front'] = []
+        minFrames = 10 ** 8
+        for s in range(self.nSessions):
+            analysisPath = self.data['AnalysisPath'][s]
+
+            for orient in ['back', 'front']:
+                filePath = self.data['CSV_'+orient][s]
+                videoPath = self.data['Video_'+orient][s]
+                dlc = DLCData(filePath, videoPath, analysisPath, fps)
+                DLC_obj[orient].append(dlc)
+                if dlc.nFrames < minFrames:
+                    minFrames = dlc.nFrames
+
+        self.minFrames = minFrames
+        self.data['DLC_obj_front'] = DLC_obj['front']
+        self.data['DLC_obj_back'] = DLC_obj['back']
+        self.plotT = np.arange(0, minFrames-1)/fps
+        animalIdx = np.arange(self.nSessions)
+        self.WTIdx = animalIdx[self.data['GeneBG'] == groups[0]]
+        self.MutIdx = animalIdx[self.data['GeneBG'] == groups[1]]
+        # grouping the animals
+
+        if self.Sex[0]==np.nan: # if no sex info
+            nGroups = 1
+        else:
+            nGroups = 2
+
+
+        if nGroups==2:
+            self.maleIdx = np.where(self.data['Sex']=='M')[0]
+            self.femaleIdx = np.where(self.data['Sex']=='F')[0]
+
+        self.startVoltage = [0.27, 5] # 5 rpm = 0.273 V
+        self.endVoltage = [4.34, 80]
+        self.rod_a = (self.endVoltage[1] - self.startVoltage[1]) / (self.endVoltage[0] - self.startVoltage[0])
+        self.rod_b = self.endVoltage[1] - self.endVoltage[0] * self.rod_a
+
+    def align(self, rod_fps):
+        # preprocess data, align the video with rod speed.
+        # we will need to manually label the number of frame when rod start to turn
+        # load the csv files
+        stampCSV = os.path.join(self.dataFolder,'Videos', 'timeStamp.csv')
+        timeStamp = pd.read_csv(stampCSV)
+        self.data['rodData'] = [[] for x in range(self.nSessions)]
+        for ss in range(self.nSessions):
+            DLC_obj_front = self.data['DLC_obj_front'][ss]
+            DLC_obj_back = self.data['DLC_obj_back'][ss]
+            dateExpr = r'Rotarod_(\d+?)_'
+            sessionTime = re.findall(dateExpr, self.data['CSV_back'][ss])
+            startFront = timeStamp['front'][timeStamp['session'] == int(sessionTime[0])]
+            startBack = timeStamp['back'][timeStamp['session'] == int(sessionTime[0])]
+            t_back = np.arange(DLC_obj_back.nFrames)/self.fps
+            t_front = np.arange(DLC_obj_front.nFrames)/self.fps
+            aligned_t_back = t_back-t_back[int(startBack)]
+            aligned_t_front = t_front-t_front[int(startFront)]
+            self.data['DLC_obj_back'][ss].data['aligned_t'] = aligned_t_back
+            self.data['DLC_obj_front'][ss].data['aligned_t'] = aligned_t_front
+
+            # add the rod speed result, load the .mat files
+            rodMat = loadmat(self.data['Rod_speed'][ss])
+
+            # Generate a sample signal with change points
+
+            # Create a change point detection object using a specific algorithm (e.g., 'Pelt' or 'Binseg')
+            signal = rodMat['runningSpeedVoltage']
+
+            algo = rpt.Pelt(model="l2").fit(signal)
+            # Predict the change points
+            predicted_bkps = algo.predict(pen=3)
+
+            # Display results
+            # change the signal to rod speed
+
+            rodSpeed = signal*self.rod_a+self.rod_b
+            if self.data['Trial'][ss] <=6:
+                max_jump = (40-5)/(60*5*4)
+            else:
+                max_jump = (80-10)/(60*5*4)
+            # Smooth the signal
+            smoothed_signal = np.copy(rodSpeed)
+            #running average first
+            tempSpeed = rodSpeed
+            for sss in range(6):
+                windowSize = 4+sss*1
+                for i in range(predicted_bkps[0], predicted_bkps[-2]):
+                    if i > predicted_bkps[0] + windowSize/2 and i < predicted_bkps[-2] - windowSize/2:
+                        smoothed_signal[i] = np.mean(tempSpeed [i-windowSize//2 : i+windowSize//2])
+
+                    elif i <= predicted_bkps[0] + windowSize/2:
+                        smoothed_signal[i] = np.mean(tempSpeed [predicted_bkps[0]+1: i + windowSize // 2])
+                    elif i >= predicted_bkps[-2] - windowSize/2:
+                        smoothed_signal[i] = np.mean(tempSpeed [i - windowSize // 2: predicted_bkps[-2]-1])
+                tempSpeed = smoothed_signal
+                # jump = smoothed_signal[i] - smoothed_signal[i - 1]
+                # if abs(jump) > max_jump:
+                #     smoothed_signal[i] = smoothed_signal[i - 1] + max_jump
+                    #smoothed_signal[i] = (rodSpeed[i-1]+rodSpeed[i+1])/2
+
+            algo = rpt.Pelt(model="l2").fit(smoothed_signal)
+            # Predict the change points
+            new_predicted_bkps = algo.predict(pen=1)
+
+            # smooth one more round with the new predicted change point
+            for sss in range(6):
+                windowSize = 4+sss*1
+                for i in range(new_predicted_bkps[0], new_predicted_bkps[-2]):
+                    if i > new_predicted_bkps[0] + windowSize / 2 and i < new_predicted_bkps[-2] - windowSize / 2:
+                        smoothed_signal[i] = np.mean(tempSpeed[i - windowSize // 2: i + windowSize // 2])
+                    elif i <= new_predicted_bkps[0] + windowSize / 2:
+                        smoothed_signal[i] = np.mean(tempSpeed[new_predicted_bkps[0] + 1: i + windowSize // 2])
+                    elif i >= new_predicted_bkps[-2] - windowSize / 2:
+                        smoothed_signal[i] = np.mean(tempSpeed[i - windowSize // 2: new_predicted_bkps[-2] - 1])
+
+            rodTime = (np.arange(len(signal)) - new_predicted_bkps[0]) / rod_fps
+            plt.figure()
+            plt.plot(rodTime,rodSpeed)
+            plt.plot(rodTime,smoothed_signal)
+            plt.scatter(0, smoothed_signal[new_predicted_bkps[0]], s=200)
+            plt.scatter(rodTime[new_predicted_bkps[2]], smoothed_signal[new_predicted_bkps[2]], s=200)
+            plt.scatter(rodTime[new_predicted_bkps[-2]],smoothed_signal[new_predicted_bkps[-2]], s=200)
+            plt.title('Start point for ' + str(self.data['Animal'][ss]) + ' session ' + sessionTime[0])
+            #plt.show()
+            savefigpath = os.path.join(self.analysisFolder,'StartPoint_rodSpeed')
+            if not os.path.exists(savefigpath):
+                os.makedirs(savefigpath)
+            plt.savefig(os.path.join(savefigpath, 'Start point for ' + str(self.data['Animal'][ss]) + ' session ' + sessionTime[0]+'.png'))
+            plt.close()
+            # save the running speed and voltage
+            rodData = {}
+            rodData['rawSpeed'] = rodSpeed
+            rodData['smoothedSpeed'] = smoothed_signal
+            rodData['time'] = rodTime
+            self.data['DLC_obj_back'][ss].data['rodData'] = rodData
+            self.data['DLC_obj_front'][ss].data['rodData'] = rodData
+
+    def stride_analysis(self,savefigpath):
+        # stride analysis for rotarod behavior
+        #strideMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
+
+        for idx, obj in enumerate(self.data['DLC_obj_front']):
+            obj.get_stride('front')
+
+        for idx, obj in enumerate(self.data['DLC_obj_back']):
+            obj.get_stride('back')
+
+
 if __name__ == "__main__":
-    root_dir = r'Z:\HongliWang\openfield\Ahtesha\DLC_project'
+    import matplotlib.font_manager as fm
+
+    # Get the list of available font families
+    available_fonts = [f.name for f in fm.fontManager.ttflist]
+
+    # Check if Arial is available
+    if not 'Arial' in available_fonts:
+        plt.rcParams['font.family'] = 'Liberation Sans'
+
+    root_dir = r'/media/linda/WD_red_4TB/DeepLabCut_data/rotarod/Nlgn_rotarod'
     #root_dir = r'Z:\HongliWang\openfield\Erin\openfield_MGRPR_cKO'
     dataFolder = os.path.join(root_dir,'Data')
     #animals = ['1795', '1804', '1805', '1825', '1827', '1829']
@@ -1729,7 +2024,7 @@ if __name__ == "__main__":
     # add animal identity
     #GeneBG = ['WT', 'Mut', 'Mut', 'WT']
     #GeneBG = ['WT', 'Mut', 'WT', 'Mut', 'Mut', 'WT']
-    fps = 40
+    fps = 60
 
     """analysis
     1. moving distance
@@ -1745,9 +2040,12 @@ if __name__ == "__main__":
     # plot the cumulative distance traveled
     savemotionpath = os.path.join(root_dir, 'Summary', 'DLC')
     groups = ['Ctrl', 'Exp']
-    behavior = 'openfield'
-    DLCSum = DLCSummary(root_dir, fps, groups,behavior)
-
+    behavior = 'Rotarod'
+    DLCSum = DLC_Rotarod(root_dir, fps, groups,behavior)
+    rod_fps = 4 # recorded at 4 Hz
+    DLCSum.align(rod_fps)
+    DLCSum.get_result(self)
+    DLCSum.stride_analysis(savemotionpath)
     # basic motor-related analysis
     #
     DLCSum.center_analysis(savemotionpath)
