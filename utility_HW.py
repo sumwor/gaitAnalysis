@@ -4,8 +4,11 @@ import pandas as pd
 from scipy.signal import butter, filtfilt
 import numpy as np
 import matplotlib.pyplot as plt
-
+from moviepy.editor import VideoFileClip, clips_array, ColorClip,CompositeVideoClip, concatenate_videoclips
+import os
 import warnings
+import glob
+from tqdm import tqdm
 warnings.filterwarnings("ignore")
 
 
@@ -67,6 +70,8 @@ def butter_lowpass_filter(data, cutoff_freq, fs, order=5):
     y = filtfilt(b, a, data)
     return y
 
+def plot_keypoint(video, frame, keypoint):
+    pass
 
 def fill_nans_and_split(vector, max_nan_chunk=5):
     # Helper function to linearly interpolate NaNs
@@ -185,9 +190,106 @@ def read_rotarod_csv(filepath, animalID):
 
     return output_dict
 
+def concatenate_videos(video1_path, video2_path, timeStamp):
+    """ concatenate the videos
+    input:
+    filepath: the path of the RR_results.csv file
+    aniamlID: Id of the animal of interest
+    output"
+    """
+    # Load the two video clips
+    video1 = VideoFileClip(video1_path)
+    video2 = VideoFileClip(video2_path)
+
+    paths = video1_path.split(os.path.sep)
+    dir_path = os.path.join(*paths[0:-2])
+    output_path = os.path.join(dir_path, 'concatenated', paths[-1][0:-8] + '.mp4')
+    # Write the output to a file
+
+    black_clip1 = ColorClip(size=(video1.w, video1.h), color=(0, 0, 0), duration=black_duration1)
+    black_clip2 = ColorClip(size=(video2.w, video2.h), color=(0, 0, 0), duration=black_duration2)
+
+    m = timeStamp['back'][0]  # Frame number to align in video1
+    n = timeStamp['front'][0] # Frame number to align in video2
+
+    # Calculate the durations of the black frames to add (in seconds)
+    frame_rate1 = video1.fps
+    frame_rate2 = video2.fps
+
+    # Duration for black frames
+    black_duration1 = (n - m) / frame_rate1 if m < n else 0
+    black_duration2 = (m - n) / frame_rate2 if n < m else 0
+    if black_duration1 > 0:
+        video1 = concatenate_videoclips([black_clip1, video1])
+    if black_duration2 > 0:
+        video2 = concatenate_videoclips([black_clip2, video2])
+    # Make sure the videos have the same duration
+    max_duration = max(video1.duration, video2.duration)
+    if video1.duration < max_duration:
+        # Create a black clip with the same size as video1
+        black_clip = ColorClip(size=video1.size, color=(0, 0, 0), duration=max_duration - video1.duration)
+        # Concatenate video1 with the black clip
+        video1 = concatenate_videoclips([video1, black_clip])
+    elif video2.duration < max_duration:
+        # Create a black clip with the same size as video2
+        black_clip = ColorClip(size=video2.size, color=(0, 0, 0), duration=max_duration - video2.duration)
+        # Concatenate video2 with the black clip
+        video2 = concatenate_videoclips([video2, black_clip])
+
+    # Concatenate videos side by side
+    final_clip = clips_array([[video1, video2]])
+
+
+    # Write the output to a file
+
+    final_clip.write_videofile(output_path, codec="libx264")
+
+
+def distance_points_to_line(x_coords, y_coords, line_point1, line_point2):
+    """
+    Calculate the perpendicular distances from multiple points to a line defined by two points.
+
+    Parameters:
+    x_coords (array-like): Array of x-coordinates for the points.
+    y_coords (array-like): Array of y-coordinates for the points.
+    line_point1 (tuple): The first point on the line (x1, y1).
+    line_point2 (tuple): The second point on the line (x2, y2).
+
+    Returns:
+    np.ndarray: An array of distances from each point to the line.
+    """
+    x0 = np.array(x_coords)
+    y0 = np.array(y_coords)
+    x1, y1 = line_point1
+    x2, y2 = line_point2
+
+    # Calculate the components of the distance formula
+    numerator = (y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1
+    denominator = np.sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2)
+
+    # Distance from each point to the line
+    distances = numerator / denominator
+    return distances
+
 if __name__ == "__main__":
     x = [1, 1, 1, np.nan, 0.4, 0.6, np.nan, np.nan, 0, 1, 0,1, 1,1,1,1,0,1, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 1,0.9, 1.1,1.2]
     #result, index = fill_nans_and_split(x)
     filepath = r'/media/linda/WD_red_4TB/DeepLabCut_data/rotarod/Nlgn_rotarod/RR_Results.csv'
     animalID = 'ASD409'
-    read_rotarod_csv(filepath, animalID)
+    #read_rotarod_csv(filepath, animalID)
+    datapath = r'Z:\HongliWang\Rotarod\Nlgn_rotarod\Data\Videos'
+    videoList = os.listdir(os.path.join(datapath,'back'))
+
+    timeStampPath = r'Z:\HongliWang\Rotarod\Nlgn_rotarod\Data\Videos\timeStamp.csv'
+    timeStamp = pd.read_csv(timeStampPath)
+    for v in videoList:
+
+        video1 = v
+        paths = video1.split(os.path.sep)
+        video2_folder = os.path.join(datapath,'front')
+        filepattern = paths[-1][0:-8]
+        video2 = glob.glob(os.path.join(video2_folder, filepattern+'*.avi'))[0]
+        video1 = os.path.join(datapath,'back',video1)
+        time = timeStamp[timeStamp['session'] ==int(filepattern[-10:])]
+        video_save = os.path.join(datapath,'concatenated',paths[-1][0:-10]+'.mp4')
+        concatenate_videos(video1, video2, time)
