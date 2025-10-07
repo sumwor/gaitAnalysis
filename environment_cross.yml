@@ -1,0 +1,8 @@
+name: keypoint_moseq
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - scikit-image
+  - numpy==1.25
+prefix: /home/linda/miniconda3/envs/keypoint_moseq
