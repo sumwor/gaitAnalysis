@@ -34,8 +34,12 @@ from matplotlib import pyplot as plt
 import imageio
 from natsort import natsorted
 import scipy
-from scipy.signal import spectrogram,hilbert
+from scipy.signal import spectrogram,hilbert,correlate, find_peaks
 from scipy.io import loadmat
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+from matplotlib.patches import Patch
+from scipy.stats import pearsonr
 #import fitz
 #from PIL import Image
 
@@ -650,10 +654,10 @@ class DLCData:
             # examine the autocorrelation
             # average them over genotype and trial
             # find the time when rod speed reach 5/10
-            if df_entry['Trial']<=6:
-                startSpeed = 5
-            else:
-                startSpeed = 10
+            #if df_entry['Trial']<=6:
+            startSpeed = 5
+            #else:
+            #    startSpeed = 10
             startTime_auto = self.data['rodT'][self.data['rodSpeed_smoothed']>startSpeed][0]
             fig, ax = plt.subplots(2, 2, figsize=(10, 8))  # 2x2 grid for 4 subplots
             ax = ax.flatten()
@@ -700,53 +704,264 @@ class DLCData:
             # plt.xlabel('Time [s]')
             # plt.title('STFT Magnitude')
 
-            #%% cross correlation
+            #%% pearson correlation between limbs
             # phase lag?
             # generate some plots
-            xcorr = pd.DataFrame({'time': self.t_interp})
-            xcorr_group = [['left hand','right hand'], ['left foot', 'right foot'],
+            pcorr = pd.DataFrame({'time': self.t_interp})
+            corr_group = [['left hand','right hand'], ['left foot', 'right foot'],
                            ['left hand', 'left foot'], ['right hand', 'right foot']]
-            xcorr_Idx = [[0,1], [2,3], [0,2], [1,3]]
+            corr_Idx = [[0,1], [2,3], [0,2], [1,3]]
             # xcorr between hands/feet/left/right
-            timeStep = 1 # in second
-            for kp_pairs,kp_idx in zip(xcorr_group,xcorr_Idx):
+            timeStep = 2 # in second
+            for kp_pairs,kp_idx in zip(corr_group,corr_Idx):
                 corrCoeff_running = np.zeros((len(self.t_interp)))
                 for idx,t in enumerate(self.t_interp):
                     tMask = np.logical_and(self.t_interp>t, self.t_interp <t+timeStep)
                     corrCoeff_running[idx] = np.corrcoef(self.filtered_stride[tMask,kp_idx[0]],
                                                              self.filtered_stride[tMask,kp_idx[1]])[0,1]
-                xcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corrCoeff_running
-            #save cross correlation results
-            xcorr.to_csv(os.path.join(self.analysis, 'Stride crosscorrelation.csv'))
+                pcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corrCoeff_running
+            
+            # cross correlation
+            max_lag_sec = 1.0  # maximum lag to compute (in seconds)
+            dt = self.t_interp[1] - self.t_interp[0]  # time step of your signal
+            max_lag_samples = int(max_lag_sec / dt)
 
+            # Store results
+            max_xcorr = pd.DataFrame({'time': self.t_interp})
+            max_lag = pd.DataFrame({'time': self.t_interp})
+
+            for kp_pairs, kp_idx in zip(corr_group, corr_Idx):
+                # Each element will be a 2D array: shape (len(t_interp), 2*max_lag_samples+1)
+                # Arrays for max correlation and lag at each time point
+                corr_max = np.full(len(self.t_interp), np.nan)
+                lag_at_max = np.full(len(self.t_interp), np.nan)
+
+                lags = np.arange(-max_lag_samples, max_lag_samples + 1) * dt
+
+                for idx, t in enumerate(self.t_interp):
+                    # 2-second window mask
+                    tMask = (self.t_interp > t) & (self.t_interp < t + timeStep)
+                    x = self.filtered_stride[tMask, kp_idx[0]]
+                    y = self.filtered_stride[tMask, kp_idx[1]]
+
+                    if len(x) < 2 or len(y) < 2:
+                        continue
+
+                    # Normalize signals
+                    x = x - np.mean(x)
+                    y = y - np.mean(y)
+
+                    # Compute normalized cross-correlation
+                    c = correlate(y, x, mode='full')
+                    c = c / (np.std(x) * np.std(y) * len(x))
+
+                    # Center index
+                    mid = len(c) // 2
+                    c_window = c[mid - max_lag_samples: mid + max_lag_samples + 1]
+
+                    # Find max correlation and corresponding lag
+                    max_idx = np.nanargmax(c_window)
+                    corr_max[idx] = c_window[max_idx]
+                    lag_at_max[idx] = lags[max_idx]
+                
+                max_xcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corr_max
+                max_lag[kp_pairs[0]+'-'+kp_pairs[1]] = lag_at_max
+
+            #save cross correlation results
+            pcorr_renamed = pcorr.copy()
+            pcorr_renamed.columns = ['time'] + [col + '_pearson' for col in pcorr.columns[1:]]
+
+            max_xcorr_renamed = max_xcorr.copy()
+            max_xcorr_renamed.columns = ['time'] + [col + '_maxxcorr' for col in max_xcorr.columns[1:]]
+
+            max_lag_renamed = max_lag.copy()
+            max_lag_renamed.columns = ['time'] + [col + '_lag' for col in max_lag.columns[1:]]
+
+            # 2. Merge all DataFrames on 'time'
+            combined_df = pcorr_renamed.merge(max_xcorr_renamed, on='time').merge(max_lag_renamed, on='time')
+
+            # 3. Save to CSV
+            combined_df.to_csv(os.path.join(self.analysis, 'Stride correlation.csv'), index=False)
+
+            # make a plot to show pearson correlation and cross correlation and max lag
             fig,ax = plt.subplots(4, 1, figsize=(16, 10))
             # Subplot 1 (First row, spanning two columns)
-            ax[0].plot(self.t_interp, self.filtered_stride[:,0])
-            ax[0].plot(self.t_interp , self.filtered_stride[:,1])
-            ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[0].set_title('Distance between left/right hand and the rod')
+            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
+            for start_idx, end_idx in self.data['turning_period']:
+                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
+                    color='grey', alpha=0.3)
+            ax[0].set_title('Rod speed')
+            ax[0].set_ylabel('Rod speed (RPM)')
+            ax[0].tick_params(axis='x', which='both', labelbottom=False)
+            #ax[0].plot(self.t_interp , self.filtered_stride[:,1])
+            #ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
+            
+            # plot pearson correlation of hands and foot
+            ax[1].plot(self.t_interp, pcorr['left hand-right hand'], label= 'Hands')
+            ax[1].plot(self.t_interp, pcorr['left foot-right foot'], label = 'Feet')
+            #ax[1].legend(loc='upper left', bbox_to_anchor=(1, 1))
+            ax[1].set_title('Pearson correlation coefficient')
+            ax[1].tick_params(axis='x', which='both', labelbottom=False)
 
-            # Subplot 2 (Second row, first column)
-            ax[1].plot(self.t_interp, self.filtered_stride[:,2])
-            ax[1].plot(self.t_interp, self.filtered_stride[:,3])
-            ax[1].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Distance between left/right foot and the rod')
+            # plot cross correlation 
+            ax[2].plot(self.t_interp, max_xcorr['left hand-right hand'], label= 'Hands')
+            ax[2].plot(self.t_interp, max_xcorr['left foot-right foot'], label = 'Feet')
+            ax[2].tick_params(axis='x', which='both', labelbottom=False)
+            ax[2].set_title('Max cross correlation coefficient')
+            #ax[2].legend(loc='upper left', bbox_to_anchor=(1, 1))
 
-            # Subplot 3 (Second row, second column)
-            ax[2].plot(self.t_interp, xcorr['left hand-right hand'])
-            ax[2].plot(self.t_interp, xcorr['left foot-right foot'])
-            ax[2].plot(self.t_interp, np.zeros((len(self.t_interp))),c='r', linewidth=2)
-            ax[2].legend(['left hand-right hand', 'left foot-right foot'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[2].set_title('Cross correlation ')
+            # plot max lag
+            ax[3].plot(self.t_interp, max_lag['left hand-right hand'], label= 'Hands')
+            ax[3].plot(self.t_interp, max_lag['left foot-right foot'], label = 'Feet')
+            ax[3].set_title('Max lag (s)')
+            ax[3].legend(loc='upper left', bbox_to_anchor=(1, 1))
+
+            for a in ax:  # ax is a list/array of subplots
+                a.spines['top'].set_visible(False)
+                a.spines['right'].set_visible(False)
+
+            plt.savefig(os.path.join(self.analysis,'Stride correlation - HF.png'), dpi=300)  # Save as PNG fil
+            #plt.show()
+            plt.close()
+
+            # same plot to show left and right
+            fig,ax = plt.subplots(4, 1, figsize=(16, 10))
+            # Subplot 1 (First row, spanning two columns)
+            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
+            for start_idx, end_idx in self.data['turning_period']:
+                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
+                    color='grey', alpha=0.3)
+            ax[0].set_title('Rod speed')
+            ax[0].set_ylabel('Rod speed (RPM)')
+            ax[0].tick_params(axis='x', which='both', labelbottom=False)
+            #ax[0].plot(self.t_interp , self.filtered_stride[:,1])
+            #ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
+            
+            # plot pearson correlation of hands and foot
+            ax[1].plot(self.t_interp, pcorr['left hand-left foot'], label= 'Left')
+            ax[1].plot(self.t_interp, pcorr['right hand-right foot'], label = 'Right')
+            #ax[1].legend(loc='upper left', bbox_to_anchor=(1, 1))
+            ax[1].set_title('Pearson correlation coefficient')
+            ax[1].tick_params(axis='x', which='both', labelbottom=False)
+
+            # plot cross correlation 
+            ax[2].plot(self.t_interp, max_xcorr['left hand-left foot'], label= 'LEft')
+            ax[2].plot(self.t_interp, max_xcorr['right hand-right foot'], label = 'Right')
+            ax[2].tick_params(axis='x', which='both', labelbottom=False)
+            ax[2].set_title('Max cross correlation coefficient')
+            #ax[2].legend(loc='upper left', bbox_to_anchor=(1, 1))
+
+            # plot max lag
+            ax[3].plot(self.t_interp, max_lag['left hand-left foot'], label= 'Hands')
+            ax[3].plot(self.t_interp, max_lag['right hand-right foot'], label = 'Feet')
+            ax[3].set_title('Max lag (s)')
+            ax[3].legend(loc='upper left', bbox_to_anchor=(1, 1))
+
+            for a in ax:  # ax is a list/array of subplots
+                a.spines['top'].set_visible(False)
+                a.spines['right'].set_visible(False)
+
+            plt.savefig(os.path.join(self.analysis,'Stride correlation - LR.png'), dpi=300)  # Save as PNG fil
+            #plt.show()
+            plt.close()
+
+            #%% calculate hand/foot step amplitude and frequency based on peak detection
+            self.stride_amp = []
+            self.stride_time = []
+            self.stride_freq = np.full(self.filtered_stride.shape, np.nan)
+
+            time = self.t_interp
+            for ll in range(4): # step size and amplitude of 4 limbs
+            # Detect peaks (foot lifts)
+            
+                distance = self.filtered_stride[:,ll]
+                peaks, props = find_peaks(distance, prominence=2, distance=None)
+
+                # Estimate baseline before each step using local minima
+                inv_distance = -distance
+                troughs, _ = find_peaks(inv_distance, prominence=2 / 2, distance=None)
+
+                step_amplitudes = []
+                step_times = []
+
+                for peak in peaks:
+                    # Find the closest following trough (baseline)
+                    next_troughs = troughs[troughs > peak]
+                    if len(next_troughs) == 0:
+                        continue
+                    baseline_idx = next_troughs[0]
+                    amplitude = distance[peak] - distance[baseline_idx]
+                    step_amplitudes.append(amplitude)
+                    step_times.append(time[peak])
+
+                step_amplitudes = np.array(step_amplitudes)
+                step_times = np.array(step_times)
+
+                self.stride_amp.append(step_amplitudes)
+                self.stride_time.append(step_times)
+
+
+                # Compute step frequency (Hz) in running 2 second window
+                window = 2
+                freqs = np.full(len(time), np.nan)  # preallocate
+
+                for i, t in enumerate(time):
+                    # count steps within [t - window/2, t + window/2]
+                    mask = (step_times >= t - window/2) & (step_times <= t + window/2)
+                    steps_in_window = step_times[mask]
+
+                    if len(steps_in_window) >= 1:
+                        intervals = np.diff(steps_in_window)
+                        freqs[i] = 1 / np.mean(intervals)
+                    else:
+                        freqs[i] = np.nan
+
+                self.stride_freq[:,ll] = freqs
+
+
+            fig,ax = plt.subplots(5, 1, figsize=(16, 16))
+            # rod speed
+            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
+            for start_idx, end_idx in self.data['turning_period']:
+                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
+                    color='grey', alpha=0.3)
+            ax[0].set_title('Rod speed')
+            ax[0].set_ylabel('Rod speed (RPM)')
+            ax[0].tick_params(axis='x', which='both', labelbottom=False)
+
+            # Subplot 2, stride of hand
+            ax[1].plot(self.t_interp, self.filtered_stride[:,0])
+            ax[1].plot(self.t_interp , self.filtered_stride[:,1])
+            ax[1].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
+            ax[1].set_title('Distance between left/right hand and the rod')
+            ax[1].tick_params(axis='x', which='both', labelbottom=False)
+
+            # Subplot 3 foot
+            ax[2].plot(self.t_interp, self.filtered_stride[:,2])
+            ax[2].plot(self.t_interp, self.filtered_stride[:,3])
+            ax[2].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
+            ax[2].set_title('Distance between left/right foot and the rod')
+            ax[2].tick_params(axis='x', which='both', labelbottom=False)
+
+            # Subplot 4 hand amplitude
+            ax[3].stem(self.stride_time[0], self.stride_amp[0], linefmt='C0-',  basefmt=" ", label='left hand')
+            ax[3].stem(self.stride_time[1], self.stride_amp[1],linefmt='C1-',  basefmt=" ",label='right hand')
+            ax[3].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
+            ax[3].set_title('Hand step amplitude')
+            ax[3].tick_params(axis='x', which='both', labelbottom=False)
 
             # Subplot 4 (Third row, first column)
-            ax[3].plot(self.t_interp, xcorr['left hand-left foot'])
-            ax[3].plot(self.t_interp, xcorr['right hand-right foot'])
-            ax[3].plot(self.t_interp, np.zeros((len(self.t_interp))), c='r', linewidth=2)
-            ax[3].legend(['left hand-left foot', 'right hand-right foot'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[3].set_title('Cross correlation')
+            ax[4].stem(self.stride_time[2], self.stride_amp[2], linefmt='C0-',  basefmt=" ", label='left foot')
+            ax[4].stem(self.stride_time[3], self.stride_amp[3], linefmt='C1-',  basefmt=" ", label='right foot')
+            ax[4].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
+            ax[4].set_title('Foot step amplitude')
+
+            for a in ax:  # ax is a list/array of subplots
+                a.spines['top'].set_visible(False)
+                a.spines['right'].set_visible(False)
+            
             plt.tight_layout()  # Adjust subplot parameters to give specified padding
-            plt.savefig(os.path.join(self.analysis,'Stride frequency analysis.png'), dpi=300)  # Save as PNG fil
+            plt.savefig(os.path.join(self.analysis,'Stride amplitude.png'), dpi=300)  # Save as PNG fil
             #plt.show()
             plt.close()
 
@@ -754,32 +969,38 @@ class DLCData:
                     'right hand': self.filtered_stride[:,1],
                     'left foot': self.filtered_stride[:, 2],
                     'right foot': self.filtered_stride[:, 3],
+                    'stride amplitude': self.stride_amp,
+                    'stride time': self.stride_time,
+                    'stride frequency': self.stride_freq,
                     'time': self.t_interp}
-            dataDF = pd.DataFrame(data)
-            dataDF.to_csv(savedatapath)
+            #dataDF = pd.DataFrame(data)
+            #dataDF.to_csv(savedatapath)
+            # save to pickle file
+            with open( os.path.join(self.analysis, 'stride_freq.pickle'), 'wb') as f:
+                pickle.dump(data, f)
 
             #%%
             # cumulative area under the curve
-            cum_xcorr_foot = np.cumsum(xcorr['left foot-right foot'])/fps
-            cum_xcorr_hand = np.cumsum(xcorr['left hand-right hand']) / fps
-            cum_xcorr_left = np.cumsum(xcorr['left hand-left foot'])/fps
-            cum_xcorr_right = np.cumsum(xcorr['right hand-right foot']) / fps
-            plt.figure()
-            plt.plot(self.t_interp, cum_xcorr_foot)
-            plt.plot(self.t_interp, cum_xcorr_hand)
-            plt.plot(self.t_interp, cum_xcorr_left)
-            plt.plot(self.t_interp, cum_xcorr_right)
-            plt.plot(self.data['rodT'][timeMaskRod], self.data['rodSpeed_smoothed'][timeMaskRod])
-            plt.xlabel('time')
-            plt.ylabel('Cumulative area under the curve of xcorr')
-            plt.legend(['feet','hands','left','right', 'Rod speed'])
-            plt.savefig(os.path.join(self.analysis,'Stride correlation.png'), dpi=300)  # Save as PNG fil
-            #plt.show()
-            plt.close()
-            # cross correlation in 10 second window
+            # cum_xcorr_foot = np.cumsum(xcorr['left foot-right foot'])/fps
+            # cum_xcorr_hand = np.cumsum(xcorr['left hand-right hand']) / fps
+            # cum_xcorr_left = np.cumsum(xcorr['left hand-left foot'])/fps
+            # cum_xcorr_right = np.cumsum(xcorr['right hand-right foot']) / fps
+            # plt.figure()
+            # plt.plot(self.t_interp, cum_xcorr_foot)
+            # plt.plot(self.t_interp, cum_xcorr_hand)
+            # plt.plot(self.t_interp, cum_xcorr_left)
+            # plt.plot(self.t_interp, cum_xcorr_right)
+            # plt.plot(self.data['rodT'][timeMaskRod], self.data['rodSpeed_smoothed'][timeMaskRod])
+            # plt.xlabel('time')
+            # plt.ylabel('Cumulative area under the curve of xcorr')
+            # plt.legend(['feet','hands','left','right', 'Rod speed'])
+            # plt.savefig(os.path.join(self.analysis,'Stride correlation.png'), dpi=300)  # Save as PNG fil
+            # #plt.show()
+            # plt.close()
+            # # cross correlation in 10 second window
 
-            # save data in csv
-            xcorr.to_csv(os.path.join(self.analysis, 'Stride crosscorrelation.csv'))
+            # # save data in csv
+            # xcorr.to_csv(os.path.join(self.analysis, 'Stride crosscorrelation.csv'))
 
             #
             #%% tail angle
@@ -821,7 +1042,7 @@ class DLCData:
 
             # save data in csv
             tail_angle= pd.DataFrame({'angle':self.filtered_angle, 'time':self.t_interp})
-            xcorr.to_csv(os.path.join(self.analysis, 'Tail angle.csv'))
+            tail_angle.to_csv(os.path.join(self.analysis, 'Tail angle.csv'))
             # Calculate the angle in radians using atan2 for correct sign
 
             # plot the video frame with keypoint estimatino
@@ -2043,15 +2264,16 @@ class DLC_Rotarod(DLCSummary):
         sexID = []
         date = []
         timeOnRod = []
+        fallbyTurning = []
         self.behaviorResults = os.path.join(root_folder, 'RR_results.csv')
         rr_results = pd.read_csv(self.behaviorResults)
         # %% load all files
         for aidx,aa in enumerate(self.animals):
 
-            filePatternSpeed = '*' + aa + '*.csv'
-            filePatternDLC = '*' + aa + '*.csv'
-            filePatternVideo = '*' + aa + '*.avi'
-            filePatternTimestamp = '*' + aa + '*.csv'
+            filePatternSpeed = '*ASD' + aa + '*.csv'
+            filePatternDLC = '*ASD' + aa + '*.csv'
+            filePatternVideo = '*ASD' + aa + '*.avi'
+            filePatternTimestamp = '*ASD' + aa + '*.csv'
 
             speedCSV = glob.glob(f"{dataFolder}/{'Speed'}/{filePatternSpeed}")
             timeStampCSV = glob.glob(f"{dataFolder}/{'Videos'}/{filePatternTimestamp}")
@@ -2089,6 +2311,7 @@ class DLC_Rotarod(DLCSummary):
                     # find the animal and trial in rr_result
                     result = rr_results[(rr_results['animalID'].str.contains(aa)) & (rr_results['Trial'] == int(ses.group()))]
                     timeOnRod.append(int(result['Time']))
+                    fallbyTurning.append(result['fall by turning'].astype(bool).values[0])
 
         self.data = pd.DataFrame(animalID, columns=['Animal'])
         self.data['DLC'] = DLC_results
@@ -2101,6 +2324,8 @@ class DLC_Rotarod(DLCSummary):
         self.data['Date'] = date
         self.data['Timestamp'] = timeStamp
         self.data['TimeOnRod'] = timeOnRod
+        self.data['FallByTurning'] = fallbyTurning
+
         self.nSubjects = len(self.animals)
         sorted_df = self.data.sort_values(by=['Animal', 'Trial'])
         sorted_df = sorted_df.reset_index(drop=True)
@@ -2111,15 +2336,19 @@ class DLC_Rotarod(DLCSummary):
         terminalVel = np.full((self.nSubjects, max(self.data['Trial'])), np.nan)
         for idx,aa in enumerate(self.animals):
             for tt in range(max(self.data['Trial'])):
-                if tt+1 <= 6:
-                    startRPM = 5
-                    endRPM = 40
-                else:
-                    startRPM = 10
-                    endRPM = 80
+                #if tt+1 <= 6:
+                #    startRPM = 5
+                #    endRPM = 40
+                #else:
+                startRPM = 5
+                endRPM = 80
                 totalTime = 300
                 time = self.data['TimeOnRod'][np.logical_and(self.data['Animal'] == aa, self.data['Trial'] == tt+1)]
-                terminalVel[idx,tt]=((endRPM-startRPM)/totalTime)*time+startRPM
+                if len(time)>0:
+                    terminalVel[idx,tt]=((endRPM-startRPM)/totalTime)*time+startRPM
+                else:
+                    terminalVel[idx,tt]=np.nan
+
         #plt.figure()
 
         #savefigpath = os.path.join(self.sumFolder, 'terminalVelocity.svg')
@@ -2302,6 +2531,20 @@ class DLC_Rotarod(DLCSummary):
             else:
                 saveData = pd.read_csv(savedataname)
 
+            # double check for rod run (speed > 5 rpm for more than 10 seconds)
+            above = saveData['smoothed'] > 5
+
+            # Find the first index i such that all subsequent values stay > 5
+            t0 = None
+            for i in range(len(above)):
+                if above[i] and np.all(above[i:i+500]):
+                    t0 = saveData['time'][i]
+                    break
+            
+            # if t0 and saveData['Run'][0] is close enough (1s), use t0
+            #if t0 and abs(t0 - saveData['Run'][0]) < 1:
+            saveData['Run'] = np.zeros((len(saveData['time']))) + t0
+
             self.data['DLC_obj'][ss].data['rodSpeed_smoothed'] = saveData['smoothed']
             self.data['DLC_obj'][ss].data['rodStart'] = saveData['Start']
             self.data['DLC_obj'][ss].data['rodRun'] = saveData['Run']
@@ -2408,9 +2651,7 @@ class DLC_Rotarod(DLCSummary):
                     #x_tick_interval = 50
                     #x_positions = np.where((tempData['time'] % x_tick_interval) < (x_tick_interval / len(tempData['time'])))[0]
                     #x_labels = [f"{int(tempData['time'][idx])}" for idx in x_positions]
-                    #ax[0].set_xticks(ticks=x_positions, labels=x_labels)
-
-                    ax[1].plot(tempData['time'], viewNumber[0,:],linewidth=1)
+                    #ax[0].set_xticks(ticks=x_positions, label                   ax[1].plot(tempData['time'], viewNumber[0,:],linewidth=1)
                     ax[1].plot(tempData['time'], viewNumber[1,:],linewidth=1)
                     ax[1].plot(tempData['time'], viewNumber[2,:],linewidth=1)
                     for tt in segments:
@@ -2444,9 +2685,16 @@ class DLC_Rotarod(DLCSummary):
         startSpeed = np.arange(10,80,10)
         nTrials = 12
         average_xcorr = {}
-        keys = ['hands', 'feet', 'left', 'right']
+        stride = {}
+        amp_std = {}
+        # load stride frequency data
+        keys = ['left hand', 'right hand', 'left foot', 'right foot']
         for key in keys:
             average_xcorr[key] = np.full((self.nSubjects, nTrials, len(startSpeed)),np.nan)
+            amp_std[key] = np.full((self.nSubjects, nTrials),np.nan)
+        amp_std['perf'] = np.full((self.nSubjects, nTrials),np.nan)
+        genotype = self.GeneBG
+
         for idx, obj in enumerate(self.data['DLC_obj']):
             animal = self.data['Animal'][idx]
             trialIdx = self.data['Trial'][idx]-1
@@ -2454,8 +2702,9 @@ class DLC_Rotarod(DLCSummary):
 
             if self.data['DLC'][idx] is not None:
                 # load the Stride_freq
-                strideCSV = os.path.join(obj.analysis,'stride_freq.csv')
-                stride = pd.read_csv(strideCSV)
+                stridepickle = os.path.join(obj.analysis,'stride_freq.pickle')
+                with open(stridepickle, 'rb') as handle:
+                    stride = pickle.load(handle)
                 rodSpeedCSV = os.path.join(obj.analysis, 'smoothed_rodSpeed.csv')
                 rodSpeed = pd.read_csv(rodSpeedCSV)
 
@@ -2468,7 +2717,24 @@ class DLC_Rotarod(DLCSummary):
                     nanMask = np.logical_and(stride['time']>=tStart, stride['time']<=tEnd)
                     for key in bp_keys:
                         truncatedStride[key][nanMask] = np.nan
+                    
+                    truncatedStride['stride frequency'][nanMask,:] = np.nan
 
+                    # remove stride amplitude in the turning period
+                    for sa in range(4):
+                        nanMask_sa = np.logical_and(stride['stride time'][sa]>=tStart,
+                                                    stride['stride time'][sa]<=tEnd)
+                        truncatedStride['stride amplitude'][sa][nanMask_sa] = np.nan
+
+                # calculate the average standard deviation of stride amplitude
+                for kidx, key in enumerate(bp_keys):
+                    amp_std[key][animalIdx, trialIdx] = np.nanstd(truncatedStride['stride amplitude'][kidx])
+                
+                if not self.data['FallByTurning'][np.logical_and(self.data['Animal']==animal,
+                                                 self.data['Trial']==trialIdx+1)].any():
+                    amp_std['perf'][animalIdx, trialIdx] = self.data['TimeOnRod'][np.logical_and(self.data['Animal']==animal,
+                                                                                            self.data['Trial']==trialIdx+1)]
+                
                 for sSpeed in startSpeed:
                     if max(rodSpeed['smoothed']) > sSpeed:
                         timeStart = rodSpeed['time'][rodSpeed['smoothed']>sSpeed].iloc[0]
@@ -2487,46 +2753,126 @@ class DLC_Rotarod(DLCSummary):
                         for key in keys:
                             average_xcorr[key][animalIdx, trialIdx, sSpeed//10-1] = corrcoeff[key]
 
-        #%% 10-20 rpm correlation - time on rod
-                        # scatter plot of time on rod and average correlation coefficient
-        plot_kp = ['hands', 'feet', 'left', 'right']
-        for kpIdx, kp in enumerate(plot_kp):
-            for idx,animal in enumerate(self.animals):
-                cmap = get_cmap('viridis')  # Choose any Matplotlib colormap
 
-                                # Sample 12 evenly spaced colors from the colormap
-                colors = cmap(np.linspace(0, 1, nTrials))
+        #%% plot performance - stride std correlation 
+        for key in bp_keys:
+            perf = np.array(amp_std['perf'])          # shape (15, 12)
+            left_sd = np.array(amp_std[key])  # shape (15, 12)
+            genotype = np.array(genotype)             # length 15, entries 'WT' or 'KO'
 
-                plt.figure()
-                for tt in range(nTrials):
-                    plt.scatter(average_xcorr[kp][idx,tt,0],
-                            self.data['TimeOnRod'][np.logical_and(self.data['Animal']==animal,
-                            self.data['Trial']==tt+1)],
-                            c = colors[tt],label = str(tt+1))
-                    plt.ylim([0, 300])
-                    plt.xlim([-1, 1])
-                    plt.xlabel('correlation coefficient in 10-20 rpm')
-                    plt.ylabel('time on rod [s]')
-                    plt.legend()
-                    plt.title('Animal ' + animal + ' ' + kp)
+            # --- masks ---
+            wt_mask = genotype == 'WT'
+            ko_mask = genotype == 'KO'
 
-                    plt.savefig(os.path.join(self.sumFolder, 'timeOnRod-correlation_coefficient(10-20 ' + animal + ' ' + kp + ').png'))
+            # --- flatten + remove NaN for correlation ---
+            def clean_flatten(mask):
+                x = perf[mask].flatten()
+                y = left_sd[mask].flatten()
+                valid = ~np.isnan(x) & ~np.isnan(y)
+                return x[valid], y[valid]
 
-        #%% average correlation for every 10 rpm ramp
-        # average trial 9-11?
-        trialInclude = [9,10,11]
-        for kpIdx, kp in enumerate(plot_kp):
-            for idx,animal in enumerate(self.animals):
-                plt.figure()
-                for tt in trialInclude:
-                    plt.plot(startSpeed,average_xcorr[kp][idx,tt,:],label = 'Trial'+str(tt+1))
-                plt.xlim([startSpeed[0], startSpeed[-1]])
-                plt.ylim([-0.5, 1])
-                plt.xlabel('RPM')
-                plt.ylabel('Average correlation coefficient')
-                plt.title('Animal ' + animal + ' ' + kp)
-                plt.legend()
-                plt.savefig(os.path.join(self.sumFolder, 'correlation_coefficient in trial 10-12' + animal + ' ' + kp + ').png'))
+            perf_wt, sd_wt = clean_flatten(wt_mask)
+            perf_ko, sd_ko = clean_flatten(ko_mask)
+
+            # --- Pearson correlation ---
+            r_wt, p_wt = pearsonr(perf_wt, sd_wt)
+            r_ko, p_ko = pearsonr(perf_ko, sd_ko)
+
+            # --- plotting setup ---
+            trials = np.arange(12)
+            norm = Normalize(vmin=0, vmax=11)
+            cmap_wt = plt.cm.Greys
+            cmap_ko = plt.cm.Reds
+
+            plt.figure(figsize=(7,6))
+
+            # --- scatter points ---
+            for i in range(len(genotype)):
+                cmap = cmap_wt if genotype[i] == 'WT' else cmap_ko
+                colors = cmap(norm(trials))
+                for t in trials:
+                    x, y = perf[i, t], left_sd[i, t]
+                    if not np.isnan(x) and not np.isnan(y):
+                        plt.scatter(y, x, color=colors[t], s=60, edgecolor='none')
+
+            # --- correlation text ---
+            plt.text(0.05, 0.95, f"WT: r={r_wt:.2f}, p={p_wt:.3g}", transform=plt.gca().transAxes,
+                    color='black', fontsize=10, va='top')
+            plt.text(0.05, 0.88, f"KO: r={r_ko:.2f}, p={p_ko:.3g}", transform=plt.gca().transAxes,
+                    color='red', fontsize=10, va='top')
+
+            # --- legend 1: genotype ---
+            genotype_handles = [
+                Patch(facecolor='black', label='WT'),
+                Patch(facecolor='red', label='KO')
+            ]
+            legend1 = plt.legend(handles=genotype_handles, loc='upper right', frameon=False)
+
+            # --- legend 2: trial gradient ---
+            sm = ScalarMappable(norm=norm, cmap=cmap_ko)
+            cbar = plt.colorbar(sm, ax=plt.gca(), fraction=0.046, pad=0.04)
+            cbar.set_label('Trial #', rotation=270, labelpad=15)
+            cbar.set_ticks([0, 3, 6, 9])
+            cbar.set_ticklabels(['1', '4', '7', '10'])
+
+            ax = plt.gca()
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            # --- labels ---
+            plt.ylabel('Performance')
+            plt.xlabel('Left Foot SD')
+            plt.title('Performance vs ' + key + ' Amplitude SD')
+
+            plt.gca().add_artist(legend1)
+            plt.tight_layout()
+            plt.show()
+
+            # save fig in png and svg format
+            savefigpath = os.path.join(self.sumFolder, 'Performance vs ' + key + ' Amplitude SD.png')
+            plt.savefig(savefigpath, dpi=300)
+            savefigpath = os.path.join(self.sumFolder, 'Performance vs ' + key + ' Amplitude SD.svg')
+            plt.savefig(savefigpath, format='svg')
+
+        # #%% 10-20 rpm correlation - time on rod
+        #                 # scatter plot of time on rod and average correlation coefficient
+        # plot_kp = ['hands', 'feet', 'left', 'right']
+        # for kpIdx, kp in enumerate(plot_kp):
+        #     for idx,animal in enumerate(self.animals):
+        #         cmap = get_cmap('viridis')  # Choose any Matplotlib colormap
+
+        #                         # Sample 12 evenly spaced colors from the colormap
+        #         colors = cmap(np.linspace(0, 1, nTrials))
+
+        #         plt.figure()
+        #         for tt in range(nTrials):
+        #             plt.scatter(average_xcorr[kp][idx,tt,0],
+        #                     self.data['TimeOnRod'][np.logical_and(self.data['Animal']==animal,
+        #                     self.data['Trial']==tt+1)],
+        #                     c = colors[tt],label = str(tt+1))
+        #             plt.ylim([0, 300])
+        #             plt.xlim([-1, 1])
+        #             plt.xlabel('correlation coefficient in 10-20 rpm')
+        #             plt.ylabel('time on rod [s]')
+        #             plt.legend()
+        #             plt.title('Animal ' + animal + ' ' + kp)
+
+        #             plt.savefig(os.path.join(self.sumFolder, 'timeOnRod-correlation_coefficient(10-20 ' + animal + ' ' + kp + ').png'))
+
+        # #%% average correlation for every 10 rpm ramp
+        # # average trial 9-11?
+        # trialInclude = [9,10,11]
+        # for kpIdx, kp in enumerate(plot_kp):
+        #     for idx,animal in enumerate(self.animals):
+        #         plt.figure()
+        #         for tt in trialInclude:
+        #             plt.plot(startSpeed,average_xcorr[kp][idx,tt,:],label = 'Trial'+str(tt+1))
+        #         plt.xlim([startSpeed[0], startSpeed[-1]])
+        #         plt.ylim([-0.5, 1])
+        #         plt.xlabel('RPM')
+        #         plt.ylabel('Average correlation coefficient')
+        #         plt.title('Animal ' + animal + ' ' + kp)
+        #         plt.legend()
+        #         plt.savefig(os.path.join(self.sumFolder, 'correlation_coefficient in trial 10-12' + animal + ' ' + kp + ').png'))
 
     def process_for_moseq(self):
         # stride analysis for rotarod behavior
@@ -2568,7 +2914,7 @@ if __name__ == "__main__":
     if not 'Arial' in available_fonts:
         plt.rcParams['font.family'] = 'Liberation Sans'
 
-    root_dir = r'Z:\HongliWang\Rotarod\TSC_rotarod'
+    root_dir = r'Z:\HongliWang\Rotarod\Cntnap_rotarod'
     #root_dir = r'Z:\HongliWang\openfield\Erin\openfield_MGRPR_cKO'
     dataFolder = os.path.join(root_dir,'Data')
     #animals = ['1795', '1804', '1805', '1825', '1827', '1829']
