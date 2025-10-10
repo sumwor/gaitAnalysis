@@ -55,7 +55,7 @@ from tqdm import tqdm
 from utility_HW import *
 import h5py
 import statsmodels.api as sm
-from statsmodels.formula.api import ols
+from statsmodels.formula.api import ols, smf
 import io
 import subprocess as sp
 import multiprocessing
@@ -2687,11 +2687,16 @@ class DLC_Rotarod(DLCSummary):
         average_xcorr = {}
         stride = {}
         amp_std = {}
+        amp_std_running = {}
+        plot_speed = [] # keep the longest window speed to plot
+        time_step = 5 # 2 s window
         # load stride frequency data
         keys = ['left hand', 'right hand', 'left foot', 'right foot']
         for key in keys:
             average_xcorr[key] = np.full((self.nSubjects, nTrials, len(startSpeed)),np.nan)
             amp_std[key] = np.full((self.nSubjects, nTrials),np.nan)
+            amp_std_running[key] = [[[] for _ in range(nTrials)] for _ in range(self.nSubjects)]
+
         amp_std['perf'] = np.full((self.nSubjects, nTrials),np.nan)
         genotype = self.GeneBG
 
@@ -2735,6 +2740,52 @@ class DLC_Rotarod(DLCSummary):
                     amp_std['perf'][animalIdx, trialIdx] = self.data['TimeOnRod'][np.logical_and(self.data['Animal']==animal,
                                                                                             self.data['Trial']==trialIdx+1)]
                 
+                # calculate running amplitude STD as a function of rod speed
+                for kidx, key in enumerate(bp_keys):
+                    
+                    stride_time = np.array(truncatedStride['stride time'][kidx])
+                    stride_amp  = np.array(truncatedStride['stride amplitude'][kidx])
+                    rod_time    = np.array(rodSpeed['time'])
+                    rod_speed   = np.array(rodSpeed['smoothed'])
+
+                    # --- Parameters ---
+                    window_size = 10.0    # 5 seconds window
+                    step_size   = 1    # sliding step 0.5 s
+
+                    # --- Determine start time: first time rod speed > 5 ---
+                    start_idx = np.where(rod_speed > 5)[0]
+                    if len(start_idx) == 0:
+                        raise ValueError("Rod speed never exceeds 5")
+                    start_time = rod_time[start_idx[0]]
+
+                    # --- Generate sliding window time points ---
+                    end_time = rod_time[-1]
+                    window_starts = np.arange(start_time, end_time - window_size + 0.01, step_size)
+
+                    # --- Compute running std for each window ---
+                    running_std = []
+                    window_centers = []
+
+                    for t0 in window_starts:
+                        t1 = t0 + window_size
+                        mask = (stride_time >= t0) & (stride_time < t1)
+                        if np.any(mask):
+                            running_std.append(np.std(stride_amp[mask]))
+                            window_centers.append(t0 + window_size/2)
+                        else:
+                            running_std.append(np.nan)  # no stride in window
+                            window_centers.append(t0 + window_size/2)
+
+                    # --- Convert to arrays for plotting ---
+                    running_std = np.array(running_std)
+                    window_centers = np.array(window_centers)
+                    window_rod_speed = np.interp(window_centers, rod_time, rod_speed)
+                    if len(window_rod_speed) > len(plot_speed):
+                        plot_speed = window_rod_speed
+
+                    amp_std_running[key][animalIdx][trialIdx]=running_std
+
+
                 for sSpeed in startSpeed:
                     if max(rodSpeed['smoothed']) > sSpeed:
                         timeStart = rodSpeed['time'][rodSpeed['smoothed']>sSpeed].iloc[0]
@@ -2745,13 +2796,27 @@ class DLC_Rotarod(DLCSummary):
                         tempMask = np.logical_and(stride['time']>=timeStart,
                                                   stride['time']<timeEnd)
                         timeMask = np.logical_and(tempMask, ~np.isnan(truncatedStride['left hand']))
-                        corrcoeff={}
-                        corrcoeff['hands'] = np.corrcoef(stride['left hand'][timeMask],stride['right hand'][timeMask])[0,1]
-                        corrcoeff['feet'] = np.corrcoef(stride['left foot'][timeMask],stride['right foot'][timeMask])[0,1]
-                        corrcoeff['left'] = np.corrcoef(stride['left hand'][timeMask],stride['left foot'][timeMask])[0,1]
-                        corrcoeff['right'] = np.corrcoef(stride['right hand'][timeMask],stride['right foot'][timeMask])[0,1]
-                        for key in keys:
-                            average_xcorr[key][animalIdx, trialIdx, sSpeed//10-1] = corrcoeff[key]
+                        # corrcoeff={}
+                        # corrcoeff['hands'] = np.corrcoef(stride['left hand'][timeMask],stride['right hand'][timeMask])[0,1]
+                        # corrcoeff['feet'] = np.corrcoef(stride['left foot'][timeMask],stride['right foot'][timeMask])[0,1]
+                        # corrcoeff['left'] = np.corrcoef(stride['left hand'][timeMask],stride['left foot'][timeMask])[0,1]
+                        # corrcoeff['right'] = np.corrcoef(stride['right hand'][timeMask],stride['right foot'][timeMask])[0,1]
+                        # for key in keys:
+                        #     average_xcorr[key][animalIdx, trialIdx, sSpeed//10-1] = corrcoeff[key]
+
+        running_SD_matrix = {}
+        for key in bp_keys: # convert running_std to matrix
+                # find maximum length
+            max_len = max(len(trial) for subj in amp_std_running[key] for trial in subj)
+
+            # create padded matrix
+            data_3d = np.full((self.nSubjects, nTrials, max_len), np.nan)
+
+            for i, subj in enumerate(amp_std_running[key]):
+                for j, trial in enumerate(subj):
+                    if len(trial) > 0:
+                        data_3d[i, j, :len(trial)] = trial
+            running_SD_matrix[key] = data_3d
 
 
         #%% plot performance - stride std correlation 
@@ -2820,7 +2885,7 @@ class DLC_Rotarod(DLCSummary):
             ax.spines['right'].set_visible(False)
             # --- labels ---
             plt.ylabel('Performance')
-            plt.xlabel('Left Foot SD')
+            plt.xlabel('Amplitude SD')
             plt.title('Performance vs ' + key + ' Amplitude SD')
 
             plt.gca().add_artist(legend1)
@@ -2831,6 +2896,117 @@ class DLC_Rotarod(DLCSummary):
             savefigpath = os.path.join(self.sumFolder, 'Performance vs ' + key + ' Amplitude SD.png')
             plt.savefig(savefigpath, dpi=300)
             savefigpath = os.path.join(self.sumFolder, 'Performance vs ' + key + ' Amplitude SD.svg')
+            plt.savefig(savefigpath, format='svg')
+
+        #%% plot running std vs rod speed for different gnotype
+
+        # mixed ANOVA 
+        for key in bp_keys:
+
+            # Example dimensions
+            data_3d = running_SD_matrix[key]  # shape: nSubjects x nTrials x nSpeeds
+            nSubjects, nTrials, nSpeeds = data_3d.shape
+
+            # --- Step 1: Average over trials per subject ---
+            mean_per_subject = np.nanmean(data_3d, axis=1)  # shape: nSubjects x nSpeeds
+
+            rows = []
+            for i in range(nSubjects):
+                for t in range(nTrials):
+                    for s in range(nSpeeds):
+                        rows.append({
+                            'subject': f'subj_{i}',
+                            'genotype': genotype[i],
+                            'trial': t+1,                 # trial as factor
+                            'rod_speed': plot_speed[s],
+                            'stride_SD': data_3d[i, t, s]
+                        })
+
+            df_long = pd.DataFrame(rows)
+            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'KO'])
+
+            # --- Step 0: Drop rows with NaN in relevant columns ---
+            df_clean = df_long.dropna(subset=['stride_SD', 'genotype', 'rod_speed', 'trial'])
+            # --- Step 3: Fit mixed-effects model ---
+            # Random intercept per subject
+            model = smf.mixedlm("stride_SD ~ genotype * rod_speed * trial", data=df_clean, groups=df_clean["subject"])
+            result = model.fit()
+            pvals = result.pvalues
+
+            # Safe lookups for each effect of interest
+            def get_p(name):
+                return pvals.get(name, np.nan)
+
+            p_genotype = get_p('genotype[T.KO]')
+            p_genotype_speed = get_p('genotype[T.KO]:rod_speed')
+            p_trial = get_p('trial')
+            p_genotype_trial = get_p('genotype[T.KO]:trial')
+
+
+            # data_3d: shape (nSubjects, nTrials, nSpeeds)
+            # genotype: list of 'WT' or 'KO', length nSubjects
+            # plot_speed: array of speeds
+
+            genotypes_unique = ['WT', 'KO']
+            colors = {'WT': 'black', 'KO': 'red'}
+
+            plt.figure(figsize=(15, 8))
+            genotypes_unique = ['WT', 'KO']
+            colors = {'WT': 'black', 'KO': 'red'}
+
+            # 1️⃣ Left plot: rod_speed
+            ax1 = plt.subplot(1, 2, 1)
+            for g in genotypes_unique:
+                df_g = df_clean[df_clean['genotype'] == g]
+                grouped = df_g.groupby('rod_speed')['stride_SD']
+                mean_vals = grouped.mean()
+                ste_vals = grouped.std() / np.sqrt(grouped.count())
+                ax1.plot(mean_vals.index, mean_vals.values, color=colors[g], label=g, linewidth=2)
+                ax1.fill_between(mean_vals.index,
+                                mean_vals - ste_vals,
+                                mean_vals + ste_vals,
+                                color=colors[g], alpha=0.3)
+
+            ax1.set_xlabel('Rod speed')
+            ax1.set_ylabel('Stride amplitude SD (mean ± STE)')
+            ax1.set_title('Stride variability ' + key + ' vs rod speed')
+            ax1.legend()
+            ax1.spines['top'].set_visible(False)
+            ax1.spines['right'].set_visible(False)
+            ax1.text(0.95, 0.95,
+                    f'Genotype p = {p_genotype:.3e}\nGenotype×Speed p = {p_genotype_speed:.3e}',
+                    transform=ax1.transAxes, fontsize=20, ha='right', va='top',
+                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+
+            # 2️⃣ Right plot: trial
+            ax2 = plt.subplot(1, 2, 2)
+            for g in genotypes_unique:
+                df_g = df_clean[df_clean['genotype'] == g]
+                grouped = df_g.groupby('trial')['stride_SD']
+                mean_vals = grouped.mean()
+                ste_vals = grouped.std() / np.sqrt(grouped.count())
+                ax2.plot(mean_vals.index, mean_vals.values, color=colors[g], linewidth=2)
+                ax2.fill_between(mean_vals.index,
+                                mean_vals - ste_vals,
+                                mean_vals + ste_vals,
+                                color=colors[g], alpha=0.3)
+
+            ax2.set_xlabel('Trial')
+            #ax2.set_ylabel('Stride amplitude SD (mean ± STE)')
+            ax2.set_title('Stride variability ' + key + ' vs trial')
+            ax2.spines['top'].set_visible(False)
+            ax2.spines['right'].set_visible(False)
+            ax2.text(0.95, 0.95,
+                    f'Trial p = {p_trial:.3e}\nGenotype×Trial p = {p_genotype_trial:.3e}',
+                    transform=ax2.transAxes, fontsize=20, ha='right', va='top',
+                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+
+            plt.tight_layout()
+            plt.show()
+
+            savefigpath = os.path.join(self.sumFolder, 'Changes of ' + key + ' Amplitude SD.png')
+            plt.savefig(savefigpath, dpi=300)
+            savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + ' Amplitude SD.svg')
             plt.savefig(savefigpath, format='svg')
 
         # #%% 10-20 rpm correlation - time on rod
