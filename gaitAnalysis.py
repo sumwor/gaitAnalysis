@@ -2680,9 +2680,7 @@ class DLC_Rotarod(DLCSummary):
 
     def stride_summary(self):
         # things to do:
-        # 1. average correlation against rod speed
-        # 2. average stride frequency against rod speed
-        # 3. average stride amplitude against rod speed
+        # 1. foot amplitude and frequency in the beginning (5-20 rpm)
 
         #%% average cross correlation
         """ calculate the average cross correlation with in speed interval """
@@ -3447,7 +3445,8 @@ class DLC_Rotarod(DLCSummary):
             savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + '.svg')
             plt.savefig(savefigpath, format='svg')
 
-
+        #%% plot average amplitude/frequency at 5-20 RPM within trial 1-3, 4-6, 7-9, and 10-12
+        
 
     def process_for_moseq(self):
         # stride analysis for rotarod behavior
