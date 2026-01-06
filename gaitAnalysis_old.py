@@ -18,6 +18,7 @@
 # state transition matrix with time (darker color for current syllable, degraded color for
 # previous syllables
 
+
 """ questions for openfield behavior
 1. individual variance v.s. genotype variance"""
 import csv
@@ -30,24 +31,19 @@ import pickle
 import re
 import numpy as np
 from matplotlib import pyplot as plt
-plt.ion()
-
 import imageio
 from natsort import natsorted
 import scipy
-from scipy.signal import spectrogram,hilbert,correlate, find_peaks
+from scipy.signal import spectrogram,hilbert
+from scipy.signal import correlate, correlation_lags
+
 from scipy.io import loadmat
-from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Normalize
-from matplotlib.patches import Patch
-from scipy.stats import pearsonr
 #import fitz
 #from PIL import Image
-
+import cv2
 from tqdm import tqdm
 from pyPlotHW import *
-import subprocess 
-import av
+
 from utils import *
 import matplotlib.gridspec as gridspec
 from matplotlib.cm import get_cmap
@@ -58,7 +54,6 @@ from utility_HW import *
 import h5py
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
-import statsmodels.stats.api as smf
 import io
 import subprocess as sp
 import multiprocessing
@@ -66,7 +61,8 @@ import concurrent.futures
 import functools
 import seaborn as sns
 import ruptures as rpt
-import cv2
+from scipy.signal import find_peaks
+
 # todo:
 # 1. check the open field paper for related plots
 
@@ -707,264 +703,53 @@ class DLCData:
             # plt.xlabel('Time [s]')
             # plt.title('STFT Magnitude')
 
-            #%% pearson correlation between limbs
+            #%% cross correlation
             # phase lag?
             # generate some plots
-            pcorr = pd.DataFrame({'time': self.t_interp})
-            corr_group = [['left hand','right hand'], ['left foot', 'right foot'],
+            xcorr = pd.DataFrame({'time': self.t_interp})
+            xcorr_group = [['left hand','right hand'], ['left foot', 'right foot'],
                            ['left hand', 'left foot'], ['right hand', 'right foot']]
-            corr_Idx = [[0,1], [2,3], [0,2], [1,3]]
+            xcorr_Idx = [[0,1], [2,3], [0,2], [1,3]]
             # xcorr between hands/feet/left/right
-            timeStep = 2 # in second
-            for kp_pairs,kp_idx in zip(corr_group,corr_Idx):
+            timeStep = 1 # in second
+            for kp_pairs,kp_idx in zip(xcorr_group,xcorr_Idx):
                 corrCoeff_running = np.zeros((len(self.t_interp)))
                 for idx,t in enumerate(self.t_interp):
                     tMask = np.logical_and(self.t_interp>t, self.t_interp <t+timeStep)
                     corrCoeff_running[idx] = np.corrcoef(self.filtered_stride[tMask,kp_idx[0]],
                                                              self.filtered_stride[tMask,kp_idx[1]])[0,1]
-                pcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corrCoeff_running
-            
-            # cross correlation
-            max_lag_sec = 1.0  # maximum lag to compute (in seconds)
-            dt = self.t_interp[1] - self.t_interp[0]  # time step of your signal
-            max_lag_samples = int(max_lag_sec / dt)
-
-            # Store results
-            max_xcorr = pd.DataFrame({'time': self.t_interp})
-            max_lag = pd.DataFrame({'time': self.t_interp})
-
-            for kp_pairs, kp_idx in zip(corr_group, corr_Idx):
-                # Each element will be a 2D array: shape (len(t_interp), 2*max_lag_samples+1)
-                # Arrays for max correlation and lag at each time point
-                corr_max = np.full(len(self.t_interp), np.nan)
-                lag_at_max = np.full(len(self.t_interp), np.nan)
-
-                lags = np.arange(-max_lag_samples, max_lag_samples + 1) * dt
-
-                for idx, t in enumerate(self.t_interp):
-                    # 2-second window mask
-                    tMask = (self.t_interp > t) & (self.t_interp < t + timeStep)
-                    x = self.filtered_stride[tMask, kp_idx[0]]
-                    y = self.filtered_stride[tMask, kp_idx[1]]
-
-                    if len(x) < 2 or len(y) < 2:
-                        continue
-
-                    # Normalize signals
-                    x = x - np.mean(x)
-                    y = y - np.mean(y)
-
-                    # Compute normalized cross-correlation
-                    c = correlate(y, x, mode='full')
-                    c = c / (np.std(x) * np.std(y) * len(x))
-
-                    # Center index
-                    mid = len(c) // 2
-                    c_window = c[mid - max_lag_samples: mid + max_lag_samples + 1]
-
-                    # Find max correlation and corresponding lag
-                    max_idx = np.nanargmax(c_window)
-                    corr_max[idx] = c_window[max_idx]
-                    lag_at_max[idx] = lags[max_idx]
-                
-                max_xcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corr_max
-                max_lag[kp_pairs[0]+'-'+kp_pairs[1]] = lag_at_max
-
+                xcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corrCoeff_running
             #save cross correlation results
-            pcorr_renamed = pcorr.copy()
-            pcorr_renamed.columns = ['time'] + [col + '_pearson' for col in pcorr.columns[1:]]
+            xcorr.to_csv(os.path.join(self.analysis, 'Stride crosscorrelation.csv'))
 
-            max_xcorr_renamed = max_xcorr.copy()
-            max_xcorr_renamed.columns = ['time'] + [col + '_maxxcorr' for col in max_xcorr.columns[1:]]
-
-            max_lag_renamed = max_lag.copy()
-            max_lag_renamed.columns = ['time'] + [col + '_lag' for col in max_lag.columns[1:]]
-
-            # 2. Merge all DataFrames on 'time'
-            combined_df = pcorr_renamed.merge(max_xcorr_renamed, on='time').merge(max_lag_renamed, on='time')
-
-            # 3. Save to CSV
-            combined_df.to_csv(os.path.join(self.analysis, 'Stride correlation.csv'), index=False)
-
-            # make a plot to show pearson correlation and cross correlation and max lag
             fig,ax = plt.subplots(4, 1, figsize=(16, 10))
             # Subplot 1 (First row, spanning two columns)
-            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
-            for start_idx, end_idx in self.data['turning_period']:
-                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
-                    color='grey', alpha=0.3)
-            ax[0].set_title('Rod speed')
-            ax[0].set_ylabel('Rod speed (RPM)')
-            ax[0].tick_params(axis='x', which='both', labelbottom=False)
-            #ax[0].plot(self.t_interp , self.filtered_stride[:,1])
-            #ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            
-            # plot pearson correlation of hands and foot
-            ax[1].plot(self.t_interp, pcorr['left hand-right hand'], label= 'Hands')
-            ax[1].plot(self.t_interp, pcorr['left foot-right foot'], label = 'Feet')
-            #ax[1].legend(loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Pearson correlation coefficient')
-            ax[1].tick_params(axis='x', which='both', labelbottom=False)
+            ax[0].plot(self.t_interp, self.filtered_stride[:,0])
+            ax[0].plot(self.t_interp , self.filtered_stride[:,1])
+            ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
+            ax[0].set_title('Distance between left/right hand and the rod')
 
-            # plot cross correlation 
-            ax[2].plot(self.t_interp, max_xcorr['left hand-right hand'], label= 'Hands')
-            ax[2].plot(self.t_interp, max_xcorr['left foot-right foot'], label = 'Feet')
-            ax[2].tick_params(axis='x', which='both', labelbottom=False)
-            ax[2].set_title('Max cross correlation coefficient')
-            #ax[2].legend(loc='upper left', bbox_to_anchor=(1, 1))
+            # Subplot 2 (Second row, first column)
+            ax[1].plot(self.t_interp, self.filtered_stride[:,2])
+            ax[1].plot(self.t_interp, self.filtered_stride[:,3])
+            ax[1].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
+            ax[1].set_title('Distance between left/right foot and the rod')
 
-            # plot max lag
-            ax[3].plot(self.t_interp, max_lag['left hand-right hand'], label= 'Hands')
-            ax[3].plot(self.t_interp, max_lag['left foot-right foot'], label = 'Feet')
-            ax[3].set_title('Max lag (s)')
-            ax[3].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            for a in ax:  # ax is a list/array of subplots
-                a.spines['top'].set_visible(False)
-                a.spines['right'].set_visible(False)
-
-            plt.savefig(os.path.join(self.analysis,'Stride correlation - HF.png'), dpi=300)  # Save as PNG fil
-            #plt.show()
-            plt.close()
-
-            # same plot to show left and right
-            fig,ax = plt.subplots(4, 1, figsize=(16, 10))
-            # Subplot 1 (First row, spanning two columns)
-            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
-            for start_idx, end_idx in self.data['turning_period']:
-                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
-                    color='grey', alpha=0.3)
-            ax[0].set_title('Rod speed')
-            ax[0].set_ylabel('Rod speed (RPM)')
-            ax[0].tick_params(axis='x', which='both', labelbottom=False)
-            #ax[0].plot(self.t_interp , self.filtered_stride[:,1])
-            #ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            
-            # plot pearson correlation of hands and foot
-            ax[1].plot(self.t_interp, pcorr['left hand-left foot'], label= 'Left')
-            ax[1].plot(self.t_interp, pcorr['right hand-right foot'], label = 'Right')
-            #ax[1].legend(loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Pearson correlation coefficient')
-            ax[1].tick_params(axis='x', which='both', labelbottom=False)
-
-            # plot cross correlation 
-            ax[2].plot(self.t_interp, max_xcorr['left hand-left foot'], label= 'LEft')
-            ax[2].plot(self.t_interp, max_xcorr['right hand-right foot'], label = 'Right')
-            ax[2].tick_params(axis='x', which='both', labelbottom=False)
-            ax[2].set_title('Max cross correlation coefficient')
-            #ax[2].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            # plot max lag
-            ax[3].plot(self.t_interp, max_lag['left hand-left foot'], label= 'Hands')
-            ax[3].plot(self.t_interp, max_lag['right hand-right foot'], label = 'Feet')
-            ax[3].set_title('Max lag (s)')
-            ax[3].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            for a in ax:  # ax is a list/array of subplots
-                a.spines['top'].set_visible(False)
-                a.spines['right'].set_visible(False)
-
-            plt.savefig(os.path.join(self.analysis,'Stride correlation - LR.png'), dpi=300)  # Save as PNG fil
-            #plt.show()
-            plt.close()
-
-            #%% calculate hand/foot step amplitude and frequency based on peak detection
-            self.stride_amp = []
-            self.stride_time = []
-            self.stride_freq = np.full(self.filtered_stride.shape, np.nan)
-
-            time = self.t_interp
-            for ll in range(4): # step size and amplitude of 4 limbs
-            # Detect peaks (foot lifts)
-            
-                distance = self.filtered_stride[:,ll]
-                peaks, props = find_peaks(distance, prominence=2, distance=None)
-
-                # Estimate baseline before each step using local minima
-                inv_distance = -distance
-                troughs, _ = find_peaks(inv_distance, prominence=2 / 2, distance=None)
-
-                step_amplitudes = []
-                step_times = []
-
-                for peak in peaks:
-                    # Find the closest following trough (baseline)
-                    next_troughs = troughs[troughs > peak]
-                    if len(next_troughs) == 0:
-                        continue
-                    baseline_idx = next_troughs[0]
-                    amplitude = distance[peak] - distance[baseline_idx]
-                    step_amplitudes.append(amplitude)
-                    step_times.append(time[peak])
-
-                step_amplitudes = np.array(step_amplitudes)
-                step_times = np.array(step_times)
-
-                self.stride_amp.append(step_amplitudes)
-                self.stride_time.append(step_times)
-
-
-                # Compute step frequency (Hz) in running 2 second window
-                window = 2
-                freqs = np.full(len(time), np.nan)  # preallocate
-
-                for i, t in enumerate(time):
-                    # count steps within [t - window/2, t + window/2]
-                    mask = (step_times >= t - window/2) & (step_times <= t + window/2)
-                    steps_in_window = step_times[mask]
-
-                    if len(steps_in_window) >= 1:
-                        intervals = np.diff(steps_in_window)
-                        freqs[i] = 1 / np.mean(intervals)
-                    else:
-                        freqs[i] = np.nan
-
-                self.stride_freq[:,ll] = freqs
-
-
-            fig,ax = plt.subplots(5, 1, figsize=(16, 16))
-            # rod speed
-            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
-            for start_idx, end_idx in self.data['turning_period']:
-                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
-                    color='grey', alpha=0.3)
-            ax[0].set_title('Rod speed')
-            ax[0].set_ylabel('Rod speed (RPM)')
-            ax[0].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 2, stride of hand
-            ax[1].plot(self.t_interp, self.filtered_stride[:,0])
-            ax[1].plot(self.t_interp , self.filtered_stride[:,1])
-            ax[1].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Distance between left/right hand and the rod')
-            ax[1].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 3 foot
-            ax[2].plot(self.t_interp, self.filtered_stride[:,2])
-            ax[2].plot(self.t_interp, self.filtered_stride[:,3])
-            ax[2].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[2].set_title('Distance between left/right foot and the rod')
-            ax[2].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 4 hand amplitude
-            ax[3].stem(self.stride_time[0], self.stride_amp[0], linefmt='C0-',  basefmt=" ", label='left hand')
-            ax[3].stem(self.stride_time[1], self.stride_amp[1],linefmt='C1-',  basefmt=" ",label='right hand')
-            ax[3].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[3].set_title('Hand step amplitude')
-            ax[3].tick_params(axis='x', which='both', labelbottom=False)
+            # Subplot 3 (Second row, second column)
+            ax[2].plot(self.t_interp, xcorr['left hand-right hand'])
+            ax[2].plot(self.t_interp, xcorr['left foot-right foot'])
+            ax[2].plot(self.t_interp, np.zeros((len(self.t_interp))),c='r', linewidth=2)
+            ax[2].legend(['left hand-right hand', 'left foot-right foot'],loc='upper left', bbox_to_anchor=(1, 1))
+            ax[2].set_title('Cross correlation ')
 
             # Subplot 4 (Third row, first column)
-            ax[4].stem(self.stride_time[2], self.stride_amp[2], linefmt='C0-',  basefmt=" ", label='left foot')
-            ax[4].stem(self.stride_time[3], self.stride_amp[3], linefmt='C1-',  basefmt=" ", label='right foot')
-            ax[4].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[4].set_title('Foot step amplitude')
-
-            for a in ax:  # ax is a list/array of subplots
-                a.spines['top'].set_visible(False)
-                a.spines['right'].set_visible(False)
-            
+            ax[3].plot(self.t_interp, xcorr['left hand-left foot'])
+            ax[3].plot(self.t_interp, xcorr['right hand-right foot'])
+            ax[3].plot(self.t_interp, np.zeros((len(self.t_interp))), c='r', linewidth=2)
+            ax[3].legend(['left hand-left foot', 'right hand-right foot'],loc='upper left', bbox_to_anchor=(1, 1))
+            ax[3].set_title('Cross correlation')
             plt.tight_layout()  # Adjust subplot parameters to give specified padding
-            plt.savefig(os.path.join(self.analysis,'Stride amplitude.png'), dpi=300)  # Save as PNG fil
+            plt.savefig(os.path.join(self.analysis,'Stride frequency analysis.png'), dpi=300)  # Save as PNG fil
             #plt.show()
             plt.close()
 
@@ -972,38 +757,32 @@ class DLCData:
                     'right hand': self.filtered_stride[:,1],
                     'left foot': self.filtered_stride[:, 2],
                     'right foot': self.filtered_stride[:, 3],
-                    'stride amplitude': self.stride_amp,
-                    'stride time': self.stride_time,
-                    'stride frequency': self.stride_freq,
                     'time': self.t_interp}
-            #dataDF = pd.DataFrame(data)
-            #dataDF.to_csv(savedatapath)
-            # save to pickle file
-            with open( os.path.join(self.analysis, 'stride_freq.pickle'), 'wb') as f:
-                pickle.dump(data, f)
+            dataDF = pd.DataFrame(data)
+            dataDF.to_csv(savedatapath)
 
             #%%
             # cumulative area under the curve
-            # cum_xcorr_foot = np.cumsum(xcorr['left foot-right foot'])/fps
-            # cum_xcorr_hand = np.cumsum(xcorr['left hand-right hand']) / fps
-            # cum_xcorr_left = np.cumsum(xcorr['left hand-left foot'])/fps
-            # cum_xcorr_right = np.cumsum(xcorr['right hand-right foot']) / fps
-            # plt.figure()
-            # plt.plot(self.t_interp, cum_xcorr_foot)
-            # plt.plot(self.t_interp, cum_xcorr_hand)
-            # plt.plot(self.t_interp, cum_xcorr_left)
-            # plt.plot(self.t_interp, cum_xcorr_right)
-            # plt.plot(self.data['rodT'][timeMaskRod], self.data['rodSpeed_smoothed'][timeMaskRod])
-            # plt.xlabel('time')
-            # plt.ylabel('Cumulative area under the curve of xcorr')
-            # plt.legend(['feet','hands','left','right', 'Rod speed'])
-            # plt.savefig(os.path.join(self.analysis,'Stride correlation.png'), dpi=300)  # Save as PNG fil
-            # #plt.show()
-            # plt.close()
-            # # cross correlation in 10 second window
+            cum_xcorr_foot = np.cumsum(xcorr['left foot-right foot'])/fps
+            cum_xcorr_hand = np.cumsum(xcorr['left hand-right hand']) / fps
+            cum_xcorr_left = np.cumsum(xcorr['left hand-left foot'])/fps
+            cum_xcorr_right = np.cumsum(xcorr['right hand-right foot']) / fps
+            plt.figure()
+            plt.plot(self.t_interp, cum_xcorr_foot)
+            plt.plot(self.t_interp, cum_xcorr_hand)
+            plt.plot(self.t_interp, cum_xcorr_left)
+            plt.plot(self.t_interp, cum_xcorr_right)
+            plt.plot(self.data['rodT'][timeMaskRod], self.data['rodSpeed_smoothed'][timeMaskRod])
+            plt.xlabel('time')
+            plt.ylabel('Cumulative area under the curve of xcorr')
+            plt.legend(['feet','hands','left','right', 'Rod speed'])
+            plt.savefig(os.path.join(self.analysis,'Stride correlation.png'), dpi=300)  # Save as PNG fil
+            #plt.show()
+            plt.close()
+            # cross correlation in 10 second window
 
-            # # save data in csv
-            # xcorr.to_csv(os.path.join(self.analysis, 'Stride crosscorrelation.csv'))
+            # save data in csv
+            xcorr.to_csv(os.path.join(self.analysis, 'Stride crosscorrelation.csv'))
 
             #
             #%% tail angle
@@ -1045,7 +824,7 @@ class DLCData:
 
             # save data in csv
             tail_angle= pd.DataFrame({'angle':self.filtered_angle, 'time':self.t_interp})
-            tail_angle.to_csv(os.path.join(self.analysis, 'Tail angle.csv'))
+            xcorr.to_csv(os.path.join(self.analysis, 'Tail angle.csv'))
             # Calculate the angle in radians using atan2 for correct sign
 
             # plot the video frame with keypoint estimatino
@@ -1102,11 +881,9 @@ class DLCData:
             return np.nan
 
     def get_result(self):
-
         # go over the behavior result and get time before fell
         x=1
         rodData = read_rotarod_csv()
-
     def get_angular_velocity_running(self, t, savefigpath):
         # calculate angular velocity with running window t
         savedatapath = os.path.join(self.analysis, 'angular_velocity_running.pickle')
@@ -1185,7 +962,7 @@ class Moseq:
 
     def __init__(self, root_dir):
         # read
-        self.root_dir = root_dir
+
         self.filePath = os.path.join(root_dir,'Data','Moseq', 'results.h5')
         self.data = self.read_data()
 
@@ -1209,46 +986,54 @@ class Moseq:
 
     def get_syllables(self, DLCSum):
         # clean the data, get syllable transition vector
-        allClips = list(self.data.keys())
-        orig_ts_path = os.path.join(self.root_dir, 'DLCforMoseq_origTS') # csv files that store the original
-        orig_ts_files = glob.glob(f"{orig_ts_path}/*.csv")
-        # time stamp of each moseq clip
 
-        # based on DLC results, find every moseq clip that corresponds to the animal and session number
-        self.syllable = {} # store syllables by sessions (concatenate clip together)
+        for idx, ses in enumerate(self.sessions):
+            dlcObj = DLCSum.data['DLC_obj'][idx]
+            syl = self.data[ses]['syllables_reindexed']
+            self.data[ses]['next_syllable'] = [np.nan for nn in range(len(self.data[ses]['syllables_reindexed']))]
+            self.data[ses]['prev_syllable'] = [np.nan for nn in range(len(self.data[ses]['syllables_reindexed']))]
 
+            if idx == 0:
+                self.all_syllables = np.unique(syl)
+            else:
+                self.all_syllables = np.unique(np.concatenate((syl,self.all_syllables)))
+            syllable_tran = []
+            syllable_dur = []
+            transition_time = []
+            prev_s = np.nan
+            prev_syllable = prev_s
+            syl_count = 1
+            for idx, s in enumerate(syl):
+                self.data[ses]['prev_syllable'][idx] = prev_syllable
+                if np.isnan(prev_s):
+                    syllable_tran.append(s)
+                    transition_time.append(0)
+                else:
+                    if s == prev_s:
+                        syl_count += 1
+                    else:
+                        prev_syllable = prev_s
+                        self.data[ses]['next_syllable'][idx-syl_count:idx]=[s]*syl_count
+                        syllable_dur.append(syl_count)
+                        syl_count = 1
+                        syllable_tran.append(s)
+                        transition_time.append(dlcObj.t[idx])
+                prev_s = s
+            syllable_dur.append(syl_count)  # add the duration of the last syllable
+            syllable_dur = np.array(syllable_dur) / fps  # convert to seconds
+            self.data[ses]['syllable_transition'] = syllable_tran
+            self.data[ses]['syllable_duration'] = syllable_dur
+            self.data[ses]['transition_time'] = transition_time
 
-        for idx, obj in enumerate(DLCSum.data['DLC_obj']):
-            animal = self.data['Animal'][idx]
-            trialIdx = self.data['Trial'][idx]-1
-            animalIdx = self.animals.index(animal)
+        # calculate overall syllable appearance
+        syl_appear_all = []
+        for syl in self.all_syllables:
+            syl_count = 0
+            for ses in self.sessions:
+                syl_count += np.sum(self.data[ses]['syllable_transition'] == syl)
+            syl_appear_all.append(syl_count)
 
-            included_clips = [s for s in allClips if animal in s and f"trial{trialIdx}" in s]
-
-            # realign the clips to the original time
-            timeStamp = obj.data['time']
-            syllables = np.full((len(timeStamp),1), np.nan)
-            centroid = np.full((len(timeStamp), 2), np.nan)
-            heading = np.full((len(timeStamp),1), np.nan)
-            latent_state = np.full((len(timeStamp), self.data[included_clips[0]]['latent_state'].shape[1]), np.nan)
-
-            for clip in included_clips:
-                clip_num = int(clip.split('clip')[-1])
-                match = next((s for s in orig_ts_files 
-                              if animal in s and f"trial{trialIdx}" in s and f"clip{clip_num}" in s), None)
-                if match is not None:
-                    orig_time = pd.read_csv(match)['time'].to_numpy()
-                    syllable_clip = self.data[clip]['syllable']
-                    centroid_clip = self.data[clip]['centroid']
-                    heading_clip = self.data[clip]['heading']
-                    latent_state_clip = self.data[clip]['latent_state']
-
-                    syllables[orig_time] = syllable_clip
-                    centroid[orig_time, :] = centroid_clip
-                    heading[orig_time] = heading_clip
-                    latent_state[orig_time, :] = latent_state_clip
-
-
+        self.syl_appear_all = syl_appear_all
 
     def load_syllable_plot(self, root_dir):
         # change to moseq_folder first
@@ -2250,6 +2035,7 @@ class DLC_Rotarod(DLCSummary):
         super().__init__(root_folder, fps, groups,behavior)  # Call the parent class's __init__ method
 
         DLC_results = []
+        DLCforMoseq_results = []
         stage = []
         Rod_speed = []
         timeStamp = []
@@ -2261,21 +2047,36 @@ class DLC_Rotarod(DLCSummary):
         sexID = []
         date = []
         timeOnRod = []
-        fallbyTurning = []
         self.behaviorResults = os.path.join(root_folder, 'RR_results.csv')
-        rr_results = pd.read_csv(self.behaviorResults)
+        if os.path.exists(self.behaviorResults):
+            rr_results = pd.read_csv(self.behaviorResults)
+        else:
+            # the rotarod result should be stored in a separate csv file
+            self.behaviorResults = os.path.join(root_folder, 'Performance.csv')
+            performance = pd.read_csv(self.behaviorResults)
+
+        KPMS_results = {}
+        for key in ['front', 'back']:
+            KPMS_results[key] = []
+
         # %% load all files
         for aidx,aa in enumerate(self.animals):
 
-            filePatternSpeed = '*ASD' + aa + '*.csv'
-            filePatternDLC = '*ASD' + aa + '*.csv'
-            filePatternVideo = '*ASD' + aa + '*.avi'
-            filePatternTimestamp = '*ASD' + aa + '*.csv'
+            filePatternSpeed = '*' + aa + '*.csv'
+            filePatternDLC = '*' + aa + '*.csv'
+            filePatternVideo = '*' + aa + '*.avi'
+            filePatternTimestamp = '*' + aa + '*.csv'
 
             speedCSV = glob.glob(f"{dataFolder}/{'Speed'}/{filePatternSpeed}")
             timeStampCSV = glob.glob(f"{dataFolder}/{'Videos'}/{filePatternTimestamp}")
             videoFiles = glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")
             DLCFiles = glob.glob(f"{dataFolder}/{'DLC'}/{filePatternDLC}")
+            KPMSFiles = {}
+            KPMSFiles['back'] = glob.glob(f"{self.rootFolder}/{'Moseq'}/{'back'}/{'results'}/{filePatternDLC}")
+            KPMSFiles['front'] = glob.glob(f"{self.rootFolder}/{'Moseq'}/{'front'}/{'results'}/{filePatternDLC}")
+            DLCforMoseq = glob.glob(f"{self.rootFolder}/{'DLCforMoseq'}//{filePatternDLC}")
+
+
             num_files = len(videoFiles)
 
             if num_files>0:
@@ -2290,6 +2091,18 @@ class DLC_Rotarod(DLCSummary):
                         DLC_results.append(DLCFiles[DLC_ID[0]])
                     else:
                         DLC_results.append(None)
+
+
+                    if len(DLCforMoseq) > 0:
+                        DM_ID = [ID for ID in range(len(DLCforMoseq)) if matches[0] in DLCforMoseq[ID]]
+                        DLCforMoseq_results.append(DLCforMoseq[DM_ID[0]])
+
+                    for key in KPMSFiles:
+                        if len(KPMSFiles[key])>0:
+                            KPMS_results[key].append(KPMSFiles[key][DLC_ID[0]])
+                        else:
+                            KPMS_results[key].append(None)
+
                     speed_ID = [ID for ID in range(len(speedCSV)) if matches[0] in speedCSV[ID]]
                     Rod_speed.append(speedCSV[speed_ID[0]])
                     timeStamp_ID = [ID for ID in range(len(timeStampCSV)) if matches[0] in timeStampCSV[ID]]
@@ -2306,9 +2119,11 @@ class DLC_Rotarod(DLCSummary):
                     sexID.append(self.Sex[aidx])
 
                     # find the animal and trial in rr_result
-                    result = rr_results[(rr_results['animalID'].str.contains(aa)) & (rr_results['Trial'] == int(ses.group()))]
-                    timeOnRod.append(int(result['Time']))
-                    fallbyTurning.append(result['fall by turning'].astype(bool).values[0])
+
+                    #result = rr_results[(rr_results['animalID'].str.contains(aa)) & (rr_results['Trial'] == int(ses.group()))
+
+                    perf = [performance['Time spent on rod'][tt] for tt in range(len(performance)) if aa in performance['ASD ID'][tt]]
+                    timeOnRod.append(perf[ff])
 
         self.data = pd.DataFrame(animalID, columns=['Animal'])
         self.data['DLC'] = DLC_results
@@ -2321,7 +2136,12 @@ class DLC_Rotarod(DLCSummary):
         self.data['Date'] = date
         self.data['Timestamp'] = timeStamp
         self.data['TimeOnRod'] = timeOnRod
-        self.data['FallByTurning'] = fallbyTurning
+        self.data['KPMS_back'] = KPMS_results['back']
+        self.data['KPMS_front'] = KPMS_results['front']
+        if len(DLCforMoseq_results)>0:
+            self.data['DLCforMoseq'] = DLCforMoseq_results
+        else:
+            self.data['DLCforMoseq'] = [None for i in range(len(self.data))]
 
         self.nSubjects = len(self.animals)
         sorted_df = self.data.sort_values(by=['Animal', 'Trial'])
@@ -2332,20 +2152,19 @@ class DLC_Rotarod(DLCSummary):
         #%% make a plot for rotarod behavior
         terminalVel = np.full((self.nSubjects, max(self.data['Trial'])), np.nan)
         for idx,aa in enumerate(self.animals):
+            # old schedule
             for tt in range(max(self.data['Trial'])):
-                #if tt+1 <= 6:
-                #    startRPM = 5
-                #    endRPM = 40
-                #else:
+            #     if tt+1 <= 6:
+            #         startRPM = 5
+            #         endRPM = 40
+            #     else:
+            #         startRPM = 10
+            #         endRPM = 80
                 startRPM = 5
                 endRPM = 80
                 totalTime = 300
                 time = self.data['TimeOnRod'][np.logical_and(self.data['Animal'] == aa, self.data['Trial'] == tt+1)]
-                if len(time)>0:
-                    terminalVel[idx,tt]=((endRPM-startRPM)/totalTime)*time+startRPM
-                else:
-                    terminalVel[idx,tt]=np.nan
-
+                terminalVel[idx,tt]=((endRPM-startRPM)/totalTime)*time+startRPM
         #plt.figure()
 
         #savefigpath = os.path.join(self.sumFolder, 'terminalVelocity.svg')
@@ -2373,7 +2192,7 @@ class DLC_Rotarod(DLCSummary):
         self.MutIdx = animalIdx[self.data['GeneBG'] == groups[1]]
         # grouping the animals
 
-        if self.Sex[0]==np.nan: # if no sex info
+        if np.isnan(self.Sex[0]): # if no sex info
             nGroups = 1
         else:
             nGroups = 2
@@ -2406,9 +2225,8 @@ class DLC_Rotarod(DLCSummary):
             # check if fig exist
             DLC_obj = self.data['DLC_obj'][ss]
             savedataname = os.path.join(DLC_obj.analysis, 'smoothed_rodSpeed.csv')
-            if not os.path.exists(savefigname):
-
-                DLC_obj = self.data['DLC_obj'][ss]
+            noexistFile = os.path.join(DLC_obj.analysis, 'notExist.csv')
+            if not os.path.exists(savedataname):
 
                 # Generate a sample signal with change points
 
@@ -2425,8 +2243,6 @@ class DLC_Rotarod(DLCSummary):
                 # change the signal to rod speed
 
                 rodSpeed = signal*self.rod_a+self.rod_b
-
-                max_jump = (80-5)/(60*5*4)
                 # Smooth the signal
                 smoothed_signal = np.copy(rodSpeed)
                 #running average first
@@ -2486,63 +2302,66 @@ class DLC_Rotarod(DLCSummary):
                     # if abs(jump) > max_jump:
                     #     smoothed_signal[i] = smoothed_signal[i - 1] + max_jump
                         #smoothed_signal[i] = (rodSpeed[i-1]+rodSpeed[i+1])/2
-                rodTime = DLC_obj.data['rodT']
 
-                # algo = rpt.Pelt(model="l2").fit(smoothed_signal)
-                # # Predict the change points
-                # new_predicted_bkps = algo.predict(pen=170)
+                algo = rpt.Pelt(model="l2").fit(smoothed_signal)
+                # Predict the change points
+                new_predicted_bkps = algo.predict(pen=170)
 
-            # find the point when rod speed start to increase with first derivative
-                dx = np.diff(smoothed_signal)/np.diff(rodTime)
-                k=200
-                runIdx = np.where(np.convolve((dx > 0.1).astype(int), np.ones(k, dtype=int), 'valid') == k)[0][0]
-
-                startIdx = np.where(smoothed_signal>0.5)[0][0]
-                endIdx = np.where(smoothed_signal>0.5)[0][-1]
             # save the running speed and voltage
                 # save the smoothed_signal somewhere
+
+                runTimeIdx = np.where(smoothed_signal > 5)[0][0]
+                runTime = DLC_obj.data['rodT'][runTimeIdx]
+
+                DLC_obj.data['rodT'] = DLC_obj.data['rodT'] - runTime
+                DLC_obj.data['time'] = DLC_obj.data['time'] - runTime
+
+                rodTime = DLC_obj.data['rodT']
+
                 saveData={}
                 saveData['raw'] = signal
                 saveData['smoothed'] = smoothed_signal
-                saveData['time'] = rodTime
+                saveData['time'] = DLC_obj.data['rodT']
                 if rodSpeed[0] ==0:
-                    saveData['Start'] = np.zeros((len(rodTime)))+rodTime[startIdx]
-                    saveData['Run'] = np.zeros((len(rodTime)))+rodTime[runIdx]
+                    saveData['Start'] = np.zeros((len(rodTime)))+rodTime[new_predicted_bkps[0]]
+                    saveData['Run'] = 0
+                    saveData['Stop'] = np.zeros((len(rodTime)))+rodTime[new_predicted_bkps[-2]]
+                elif rodSpeed[new_predicted_bkps[1]+10] == 0:
+                    # stopped in the middle
+                    saveData['Start'] = np.zeros((len(rodTime)))+rodTime[new_predicted_bkps[0]]
+                    saveData['Run'] = 0
+                    saveData['Stop'] = np.zeros((len(rodTime))) + rodTime[new_predicted_bkps[-2]]
                 else:
                     saveData['Start'] = np.full((len(rodTime)),np.nan)
-                    saveData['Run'] = np.zeros((len(rodTime)))+rodTime[runIdx]
-                savedf= pd.DataFrame(saveData)
+                    saveData['Run'] = 0
+                    saveData['Stop'] = np.zeros((len(rodTime))) + rodTime[new_predicted_bkps[-2]]
+                savedf = pd.DataFrame(saveData)
                 savedf.to_csv(savedataname)
 
                 plt.figure()
-                plt.plot(rodTime,rodSpeed)
-                plt.plot(rodTime,smoothed_signal)
-                plt.scatter(rodTime[startIdx], 0, s=200)
-                plt.scatter(rodTime[runIdx], 0, s=200)
-                plt.scatter(rodTime[endIdx],0, s=200)
+                plt.plot(DLC_obj.data['rodT'], rodSpeed)
+                plt.plot(DLC_obj.data['rodT'], smoothed_signal)
+                plt.scatter(saveData['Start'][0], 0, s=200, label='Start')
+                plt.scatter(DLC_obj.data['rodT'][runTimeIdx], saveData['smoothed'][runTimeIdx], zorder=10, s=200,
+                            label='Run')
+                plt.scatter(saveData['Stop'][0], 0, s=200, label='Stop')
                 plt.title('Start point for ' + str(self.data['Animal'][ss]) + ' trial' + str(self.data['Trial'][ss]))
-                #plt.show()
+                plt.legend()
                 plt.savefig(savefigname)
                 plt.close()
+
             else:
                 saveData = pd.read_csv(savedataname)
-
-
-            
-            # if t0 and saveData['Run'][0] is close enough (1s), use t0
-            #if t0 and abs(t0 - saveData['Run'][0]) < 1:
-            #saveData['Run'] = np.zeros((len(saveData['time']))) + t0
 
             self.data['DLC_obj'][ss].data['rodSpeed_smoothed'] = saveData['smoothed']
             self.data['DLC_obj'][ss].data['rodStart'] = saveData['Start']
             self.data['DLC_obj'][ss].data['rodRun'] = saveData['Run']
-                # load it somewhere?
+
+            # set the run time to be time zero
+
+            # find the run time: smoothed signal lafter than 4.76
 
             #%% find the point when animal turn around
-
-            # clean the data up:
-            # 1. identify jumps in the DLC data, then infer the correct estimation based on previous and next frame
-            # 2. add a mask on over turning frames
             # if DLC file exists:
             if self.data['DLC'][ss] is not None:
                 tempData = self.data['DLC_obj'][ss].data
@@ -2643,7 +2462,9 @@ class DLC_Rotarod(DLCSummary):
                     #x_tick_interval = 50
                     #x_positions = np.where((tempData['time'] % x_tick_interval) < (x_tick_interval / len(tempData['time'])))[0]
                     #x_labels = [f"{int(tempData['time'][idx])}" for idx in x_positions]
-                    #ax[0].set_xticks(ticks=x_positions, label                   ax[1].plot(tempData['time'], viewNumber[0,:],linewidth=1)
+                    #ax[0].set_xticks(ticks=x_positions, labels=x_labels)
+
+                    ax[1].plot(tempData['time'], viewNumber[0,:],linewidth=1)
                     ax[1].plot(tempData['time'], viewNumber[1,:],linewidth=1)
                     ax[1].plot(tempData['time'], viewNumber[2,:],linewidth=1)
                     for tt in segments:
@@ -2655,126 +2476,16 @@ class DLC_Rotarod(DLCSummary):
                     plt.close()
 
                 self.data['DLC_obj'][ss].data['turning_period'] = segments
-                self.data['DLC_obj'][ss].data['turning_mask'] = np.full((len(self.data['DLC_obj'][ss].data['time'])), 1)
-                for seg in segments:
-                    self.data['DLC_obj'][ss].data['turning_mask'][seg[0]:seg[1]+1] = 0
 
-                #%% for every keypoint find the jumps
-                orig_DLC = self.data['DLC'][ss]
-                saveCorrectedPath = os.path.join(self.dataFolder, 'DLC_Corrected')
-                if not os.path.exists(saveCorrectedPath):
-                    os.makedirs(saveCorrectedPath)
-                corr_DLC = os.path.join(saveCorrectedPath, os.path.basename(orig_DLC)[:-4] + '_corrected.csv')
+            #%% align the KPMS result if available
+            if self.data['KPMS_back'][ss] is not None:
+                KPMS = pd.read_csv(self.data['KPMS_back'][ss])
+                KPMS_frameIdx = pd.read_csv(self.data['DLCforMoseq'][ss])
+                KPMS_frameIdx = KPMS_frameIdx['scorer'][2:].tolist()
+                KPMS_time = DLC_obj.data['time'][list(map(int, KPMS_frameIdx))]
+                KPMS['time'] = KPMS_time
+                KPMS.to_csv(self.data['KPMS_back'][ss], index=False)
 
-                if not os.path.exists(corr_DLC):
-                    corrected_data = {}
-                    for bp in kp_list:
-                        x_data = np.array(tempData[bp]['x'])
-                        y_data = np.array(tempData[bp]['y'])
-                        p_data = np.array(tempData[bp]['p'])
-
-                    # Calculate differences between consecutive frames
-                        dx = np.abs(np.diff(x_data))
-                        dy = np.abs(np.diff(y_data))
-                        distance = np.sqrt(dx**2 + dy**2)
-                        # Define a threshold for detecting jumps (this may need to be adjusted)
-                        jump_threshold = 200  # pixels
-
-                        # find jump points (where distance deviate largely from its neighbors)
-                        k = 5
-                        jump_frames = []
-
-                        for i in range(len(x_data)):
-                            left = max(0, i-k)
-                            right = min(len(x_data), i+k+1)
-                            neigh_x = np.delete(x_data[left:right], i-left)
-                            neigh_y = np.delete(y_data[left:right], i-left)
-
-                            med_x = np.median(neigh_x)
-                            med_y = np.median(neigh_y)
-
-                            dist = np.sqrt((x_data[i] - med_x)**2 + (y_data[i] - med_y)**2)
-                            if dist > jump_threshold:
-                                jump_frames.append(i)  # +1 to correct index after diff
-
-                        # Correct jumps by interpolation with forward and backward 5 frames that did not jump
-                        interp_window = 5
-                        for jf in jump_frames:
-                            before = []
-                            after = []
-                            before_i = jf-1
-                            while before_i >= 0 and len(before) < interp_window:
-                                if before_i not in jump_frames:
-                                    before.append(before_i)
-                                before_i -= 1
-                            after_i = jf+1
-                            while after_i < len(x_data) and len(after) < interp_window:
-                                if after_i not in jump_frames:
-                                    after.append(after_i)
-                                after_i += 1
-                            valid_idx = before[::-1] + after 
-                            xi = np.array(valid_idx)
-                            yi_x = x_data[xi]
-                            yi_y = y_data[xi]
-                            yi_p = p_data[xi]
-                            # interpolate at frame jf
-                            x_data[jf] = np.interp(jf, xi, yi_x)
-                            y_data[jf] = np.interp(jf, xi, yi_y)
-                            p_data[jf] = np.interp(jf, xi, yi_p)
-
-                        # set a new matrix to save interpolated data
-                        corrected_data[bp] = {'x': x_data, 'y': y_data, 'p': p_data}
-
-                    # save the corrected_data to a new csv file
-
-                        # load the original csv to get the header
-                        orig_df = pd.read_csv(orig_DLC, header=[0,1,2], index_col=0)
-                        corrected_df = pd.DataFrame(index=orig_df.index, columns=orig_df.columns)
-                        scorer = orig_df.columns.levels[0][0]
-                        for bp in kp_list:
-                            corrected_df[(scorer, bp, 'x')] = corrected_data[bp]['x']
-                            corrected_df[(scorer, bp, 'y')] = corrected_data[bp]['y']
-                            corrected_df[(scorer, bp, 'likelihood')] = corrected_data[bp]['p']
-                        corrected_df.to_csv(corr_DLC)
-
-                # save video with corrected keypoints
-                orig_video = self.data['Video'][ss]
-                saveVideoPath = os.path.join(self.dataFolder, 'Videos_Corrected')
-                if not os.path.exists(saveVideoPath):
-                    os.makedirs(saveVideoPath)
-                saveVideoName = os.path.join(saveVideoPath,
-                                        os.path.basename(orig_video)[:-4] + '_corrected.avi')
-                if not os.path.exists(saveVideoName):
-                        cap = cv2.VideoCapture(orig_video)
-                        fps = cap.get(cv2.CAP_PROP_FPS)
-                        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-                        # --- Create VideoWriter for output ---
-                        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                        out = cv2.VideoWriter(saveVideoName, fourcc, fps, (width, height))
-                        
-                        for frame_idx in tqdm(range(total_frames), desc="Writing corrected video"):
-                            ret, frame = cap.read()
-                            if not ret:
-                                break
-
-                            # --- Draw corrected bodyparts ---
-                            for bp, coords in corrected_data.items():
-                                x = int(coords['x'][frame_idx])
-                                y = int(coords['y'][frame_idx])
- 
-                                cv2.circle(frame, (x, y), radius=5, color=(0, 0, 255), thickness=-1)
-
-                            # --- Write frame to new video ---
-                            out.write(frame)
-
-
-                        cap.release()
-                        out.release()
-                        print(f"Saved corrected video: {saveVideoName}")
-    
     def stride_analysis(self,front_kp, back_kp):
         # stride analysis for rotarod behavior
         #strideMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
@@ -2788,42 +2499,60 @@ class DLC_Rotarod(DLCSummary):
         # for idx, obj in enumerate(self.data['DLC_obj_back']):
         #     obj.get_stride('back')
 
-    def stride_summary(self):
-        # things to do:
-        # 1. foot amplitude and frequency in the beginning (5-20 rpm)
+    def performance(self):
+        nSubjects = len(self.animals)
+        nTrials = 12
+
+        perf_csv = os.path.join(self.rootFolder,'Performance.csv')
+        perf_fall = pd.read_csv(perf_csv)
+        perf = np.full((nSubjects, nTrials), np.nan)
+        for sub in range(nSubjects):
+            animal = self.animals[sub]
+            perf_animal = np.array(self.data[self.data['Animal'] == animal]['TimeOnRod'])
+            fall_animal = np.array(perf_fall[perf_fall['ASD ID']=='ASD'+animal]['Fall by turning'])
+            for trial in range(nTrials):
+                if fall_animal[trial]==0:
+                    perf[sub,trial] = perf_animal[trial]
+
+        # plot average performance and individual performance
+        plotX = np.arange(nTrials)+1
+        fig, ax= plt.subplots()
+        plt.plot(plotX, np.nanmean(perf[self.GeneBG=='WT',:],0),'k',label='WT')
+        plt.plot(plotX, np.nanmean(perf[self.GeneBG == 'KO', :], 0), 'r', label='KO')
+        for sub in range(nSubjects):
+            if self.GeneBG[sub] == 'WT':
+                plt.plot(plotX, perf[sub,:], 'k', linewidth=0.5, alpha=0.5)
+            elif self.GeneBG[sub] == 'KO':
+                plt.plot(plotX, perf[sub, :], 'r', linewidth=0.5, alpha=0.5)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.legend()
+        ax.set_xlabel('Trial')
+        ax.set_ylabel('Time')
+
+        savefigpath = os.path.join(self.rootFolder,'Summary', 'Performance.png')
+
+        plt.savefig(savefigpath, dpi=300, bbox_inches='tight')
+        plt.close()
+    def stride_session(self):
 
         #%% average cross correlation
         """ calculate the average cross correlation with in speed interval """
-        startSpeed = np.arange(10,80,10)
+        startSpeed = np.arange(5,80,10)
         nTrials = 12
-        stride = {}
-        amp_std = {}
-        amp_std_running = {}
-        stride_amp_running = {}
-        stride_freq_running = {}
-        plot_speed = [] # keep the longest window speed to plot
-        time_step = 5 # 2 s window
-        # load stride frequency data
-        keys = ['left hand', 'right hand', 'left foot', 'right foot']
+        average_xcorr = {}
+        keys = ['hands', 'feet', 'left', 'right']
         for key in keys:
-            amp_std[key] = np.full((self.nSubjects, nTrials),np.nan)
-            amp_std_running[key] = [[[] for _ in range(nTrials)] for _ in range(self.nSubjects)]
-            stride_amp_running[key] = [[[] for _ in range(nTrials)] for _ in range(self.nSubjects)]
-            stride_freq_running[key] = [[[] for _ in range(nTrials)] for _ in range(self.nSubjects)]
-
-        amp_std['perf'] = np.full((self.nSubjects, nTrials),np.nan)
-        genotype = self.GeneBG
-
+            average_xcorr[key] = np.full((self.nSubjects, nTrials, len(startSpeed)),np.nan)
         for idx, obj in enumerate(self.data['DLC_obj']):
             animal = self.data['Animal'][idx]
             trialIdx = self.data['Trial'][idx]-1
             animalIdx = self.animals.index(animal)
 
             if self.data['DLC'][idx] is not None:
-                #%%  load the Stride_freq
-                stridepickle = os.path.join(obj.analysis,'stride_freq.pickle')
-                with open(stridepickle, 'rb') as handle:
-                    stride = pickle.load(handle)
+                # load the Stride_freq
+                strideCSV = os.path.join(obj.analysis,'stride_freq.csv')
+                stride = pd.read_csv(strideCSV)
                 rodSpeedCSV = os.path.join(obj.analysis, 'smoothed_rodSpeed.csv')
                 rodSpeed = pd.read_csv(rodSpeedCSV)
 
@@ -2836,900 +2565,807 @@ class DLC_Rotarod(DLCSummary):
                     nanMask = np.logical_and(stride['time']>=tStart, stride['time']<=tEnd)
                     for key in bp_keys:
                         truncatedStride[key][nanMask] = np.nan
-                    
-                    truncatedStride['stride frequency'][nanMask,:] = np.nan
 
-                    # remove stride amplitude in the turning period
-                    for sa in range(4):
-                        nanMask_sa = np.logical_and(stride['stride time'][sa]>=tStart,
-                                                    stride['stride time'][sa]<=tEnd)
-                        truncatedStride['stride amplitude'][sa][nanMask_sa] = np.nan
-
-                # calculate the average standard deviation of stride amplitude
-                for kidx, key in enumerate(bp_keys):
-                    amp_std[key][animalIdx, trialIdx] = np.nanstd(truncatedStride['stride amplitude'][kidx])
-                
-                if not self.data['FallByTurning'][np.logical_and(self.data['Animal']==animal,
-                                                 self.data['Trial']==trialIdx+1)].any():
-                    amp_std['perf'][animalIdx, trialIdx] = self.data['TimeOnRod'][np.logical_and(self.data['Animal']==animal,
-                                                                                            self.data['Trial']==trialIdx+1)]
-                
-                # calculate running amplitude STD as a function of rod speed
-                rod_time    = np.array(rodSpeed['time'])
-                rod_speed   = np.array(rodSpeed['smoothed'])
-                                    # --- Parameters ---
-                window_size = 10.0    # 5 seconds window
-                step_size   = 1    # sliding step 0.5 s
-
-                # --- Determine start time: first time rod speed > 5 ---
-                start_idx = np.where(rod_speed > 5)[0]
-                if len(start_idx) == 0:
-                    raise ValueError("Rod speed never exceeds 5")
-                start_time = rod_time[start_idx[0]]
-
-                # --- Generate sliding window time points ---
-                below_zero_idx = np.where(rod_speed <= 0)[0]
-
-                # Only consider "drops to zero" that happen *after* start_time
-                below_zero_after_start = below_zero_idx[rod_time[below_zero_idx] > start_time]
-
-                if len(below_zero_after_start) > 0:
-                    # the first drop to zero after motion began
-                    end_zero_time = rod_time[below_zero_after_start[0]]
-                    end_time = end_zero_time - 2
-                    # ensure it doesn’t go earlier than start_time
-                    if end_time <= start_time:
-                        end_time = rod_time[-1]
-                else:
-                    # if it never returns to zero
-                    end_time = rod_time[-1]
-
-                window_starts = np.arange(start_time, end_time - window_size + 0.01, step_size)
-                
-                for kidx, key in enumerate(bp_keys):
-                    
-                    stride_time = np.array(truncatedStride['stride time'][kidx])
-                    stride_amp  = np.array(truncatedStride['stride amplitude'][kidx])
-
-
-                    # --- Compute running amp, freq, and amp std for each window ---
-                    running_std = []
-                    running_amp = []
-                    running_freq = []
-                    window_centers = []
-
-                    for t0 in window_starts:
-                        t1 = t0 + window_size
-                        mask = (stride_time >= t0) & (stride_time < t1)
-                        if np.any(mask):
-                            running_std.append(np.std(stride_amp[mask]))
-                            running_amp.append(np.nanmean(stride_amp[mask]))
-                            running_freq.append(np.sum(mask)/window_size)  # strides per second
-                            window_centers.append(t0 + window_size/2)
-                        else:
-                            running_std.append(np.nan)  # no stride in window
-                            running_amp.append(np.nan)
-                            running_freq.append(np.nan)
-                            window_centers.append(t0 + window_size/2)
-
-                    # --- Convert to arrays for plotting ---
-                    running_std = np.array(running_std)
-                    running_amp = np.array(running_amp)
-                    running_freq = np.array(running_freq)
-                    window_centers = np.array(window_centers)
-                    window_rod_speed = np.interp(window_centers, rod_time, rod_speed)
-                    if len(window_rod_speed) > len(plot_speed):
-                        plot_speed = window_rod_speed
-
-                    amp_std_running[key][animalIdx][trialIdx]=running_std
-                    stride_amp_running[key][animalIdx][trialIdx]=running_amp
-                    stride_freq_running[key][animalIdx][trialIdx]=running_freq
-
-                #%% load correlation 
-                corrCSV = os.path.join(obj.analysis,'Stride correlation.csv')
-                correlation = pd.read_csv(corrCSV)
-
-                truncatedCorr = copy.deepcopy(correlation)
-                corr_keys = correlation.keys().tolist()
-                corr_keys.remove('time')
+                turning_chunks = []
                 for tInterval in obj.data['turning_period']:
-                    tStart = max(stride['time'][0], obj.data['time'][tInterval[0]])
-                    tEnd = min(stride['time'][len(stride['time'])-1],obj.data['time'][tInterval[1]])
-                    nanMask = np.logical_and(correlation['time']>=tStart, correlation['time']<=tEnd)
-                    for key in corr_keys:
-                        truncatedCorr[key][nanMask] = np.nan
-
-                # initialize variable in the beginning
-                if idx == 0:
-                    corr_summary = {}
-                    for key in corr_keys:
-                        corr_summary[key] =  [[[] for _ in range(nTrials)] for _ in range(self.nSubjects)] 
-                    corr_summary['rodSpeed'] =  [[[] for _ in range(nTrials)] for _ in range(self.nSubjects)] 
-
-                # take only time within start_time and end_time
-                time_mask = np.logical_and(truncatedCorr['time']>=start_time, truncatedCorr['time']<=end_time)
-                for key in corr_keys:
-                    corr_summary[key][animalIdx][trialIdx] = truncatedCorr[key][time_mask]
-                # interpolate time to rod speed
-                corr_speed = np.interp(correlation['time'][time_mask], rod_time, rod_speed)
-                corr_summary['rodSpeed'][animalIdx][trialIdx] = corr_speed
-                
-              
-
-
-
-        #%% convert list to matrix, padding with NaN
-        running_SD_matrix = {}
-        for key in bp_keys: # convert running_std to matrix
-                # find maximum length
-            max_len = max(len(trial) for subj in amp_std_running[key] for trial in subj)
-
-            # create padded matrix
-            data_3d = np.full((self.nSubjects, nTrials, max_len), np.nan)
-
-            for i, subj in enumerate(amp_std_running[key]):
-                for j, trial in enumerate(subj):
-                    if len(trial) > 0:
-                        data_3d[i, j, :len(trial)] = trial
-            running_SD_matrix[key] = data_3d
-
-        running_amp_matrix = {}
-        for key in bp_keys: # convert running_std to matrix
-            # find maximum length
-            max_len = max(len(trial) for subj in stride_amp_running[key] for trial in subj)
-
-            # create padded matrix
-            data_3d = np.full((self.nSubjects, nTrials, max_len), np.nan)
-
-            for i, subj in enumerate(stride_amp_running[key]):
-                for j, trial in enumerate(subj):
-                    if len(trial) > 0:
-                        data_3d[i, j, :len(trial)] = trial
-            running_amp_matrix[key] = data_3d
-
-        running_freq_matrix = {}
-        for key in bp_keys: # convert running_std to matrix
-            # find maximum length
-            max_len = max(len(trial) for subj in stride_freq_running[key] for trial in subj)
-
-            # create padded matrix
-            data_3d = np.full((self.nSubjects, nTrials, max_len), np.nan)
-
-            for i, subj in enumerate(stride_freq_running[key]):
-                for j, trial in enumerate(subj):
-                    if len(trial) > 0:
-                        data_3d[i, j, :len(trial)] = trial
-            running_freq_matrix[key] = data_3d
-
-        corr_summary_matrix = {}
-        for key in corr_keys:
-            # Determine a common rod speed grid for interpolation
-            # You can use the min/max across all trials to define it
-            all_speeds = []
-            for subj, subj_corr in zip(corr_summary[key], corr_summary['rodSpeed']):
-                for trial, trial_speed in zip(subj, subj_corr):
-                    if len(trial) > 0:
-                        all_speeds.append(trial_speed)
-            all_speeds = np.concatenate(all_speeds)
-            
-            # Define a common rod speed vector (e.g., 0.1 step)
-            rod_speed_grid = np.arange(np.nanmin(all_speeds), np.nanmax(all_speeds)+0.1, 0.1)
-
-            nSubjects = len(corr_summary[key])
-            nTrials   = max(len(subj) for subj in corr_summary[key])
-            nSpeeds   = len(rod_speed_grid)
-
-            # Initialize 3D matrix with NaNs
-            data_3d = np.full((nSubjects, nTrials, nSpeeds), np.nan)
-
-            for i, subj_corr in enumerate(corr_summary[key]):
-                for j, trial_corr in enumerate(subj_corr):
-                    trial_speed = corr_summary['rodSpeed'][i][j]  # corresponding rod speed for this trial
-                    if len(trial_corr) > 0:
-                        # Interpolate trial data onto common rod speed grid
-                        data_interp = np.interp(
-                            rod_speed_grid,         # new x (grid)
-                            trial_speed,            # original x
-                            trial_corr,             # original y
-                            left=np.nan,            # pad out-of-bounds with NaN
-                            right=np.nan
-                        )
-                        data_3d[i, j, :] = data_interp
-
-            corr_summary_matrix[key] = (rod_speed_grid, data_3d)
-        
- 
-        #%% plot performance - stride std correlation 
-        for key in bp_keys:
-            perf = np.array(amp_std['perf'])          # shape (15, 12)
-            left_sd = np.array(amp_std[key])  # shape (15, 12)
-            genotype = np.array(genotype)             # length 15, entries 'WT' or 'KO'
-
-            # --- masks ---
-            wt_mask = genotype == 'WT'
-            ko_mask = genotype == 'KO'
-
-            # --- flatten + remove NaN for correlation ---
-            def clean_flatten(mask):
-                x = perf[mask].flatten()
-                y = left_sd[mask].flatten()
-                valid = ~np.isnan(x) & ~np.isnan(y)
-                return x[valid], y[valid]
-
-            perf_wt, sd_wt = clean_flatten(wt_mask)
-            perf_ko, sd_ko = clean_flatten(ko_mask)
-
-            # --- Pearson correlation ---
-            r_wt, p_wt = pearsonr(perf_wt, sd_wt)
-            r_ko, p_ko = pearsonr(perf_ko, sd_ko)
-
-            # --- plotting setup ---
-            trials = np.arange(12)
-            norm = Normalize(vmin=0, vmax=11)
-            cmap_wt = plt.cm.Greys
-            cmap_ko = plt.cm.Reds
-
-            plt.figure(figsize=(7,6))
-
-            # --- scatter points ---
-            for i in range(len(genotype)):
-                cmap = cmap_wt if genotype[i] == 'WT' else cmap_ko
-                colors = cmap(norm(trials))
-                for t in trials:
-                    x, y = perf[i, t], left_sd[i, t]
-                    if not np.isnan(x) and not np.isnan(y):
-                        plt.scatter(y, x, color=colors[t], s=60, edgecolor='none')
-
-            # --- correlation text ---
-            plt.text(0.05, 0.95, f"WT: r={r_wt:.2f}, p={p_wt:.3g}", transform=plt.gca().transAxes,
-                    color='black', fontsize=10, va='top')
-            plt.text(0.05, 0.88, f"KO: r={r_ko:.2f}, p={p_ko:.3g}", transform=plt.gca().transAxes,
-                    color='red', fontsize=10, va='top')
-
-            # --- legend 1: genotype ---
-            genotype_handles = [
-                Patch(facecolor='black', label='WT'),
-                Patch(facecolor='red', label='KO')
-            ]
-            legend1 = plt.legend(handles=genotype_handles, loc='upper right', frameon=False)
-
-            # --- legend 2: trial gradient ---
-            sm = ScalarMappable(norm=norm, cmap=cmap_ko)
-            cbar = plt.colorbar(sm, ax=plt.gca(), fraction=0.046, pad=0.04)
-            cbar.set_label('Trial #', rotation=270, labelpad=15)
-            cbar.set_ticks([0, 3, 6, 9])
-            cbar.set_ticklabels(['1', '4', '7', '10'])
-
-            ax = plt.gca()
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-            # --- labels ---
-            plt.ylabel('Performance')
-            plt.xlabel('Amplitude SD')
-            plt.title('Performance vs ' + key + ' Amplitude SD')
-
-            plt.gca().add_artist(legend1)
-            plt.tight_layout()
-            plt.show()
-
-            # save fig in png and svg format
-            savefigpath = os.path.join(self.sumFolder, 'Performance vs ' + key + ' Amplitude SD.png')
-            plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Performance vs ' + key + ' Amplitude SD.svg')
-            plt.savefig(savefigpath, format='svg')
-
-        #%% plot running std vs rod speed for different gnotype
-
-        # mixed ANOVA 
-        for key in bp_keys:
-
-            # Example dimensions
-            data_3d = running_SD_matrix[key]  # shape: nSubjects x nTrials x nSpeeds
-            nSubjects, nTrials, nSpeeds = data_3d.shape
-
-            # --- Step 1: Average over trials per subject ---
-            mean_per_subject = np.nanmean(data_3d, axis=1)  # shape: nSubjects x nSpeeds
-
-            rows = []
-            for i in range(nSubjects):
-                for t in range(nTrials):
-                    for s in range(nSpeeds):
-                        rows.append({
-                            'subject': f'subj_{i}',
-                            'genotype': genotype[i],
-                            'trial': t+1,                 # trial as factor
-                            'rod_speed': plot_speed[s],
-                            'stride_SD': data_3d[i, t, s]
-                        })
-
-            df_long = pd.DataFrame(rows)
-            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'KO'])
-
-            # --- Step 0: Drop rows with NaN in relevant columns ---
-            df_clean = df_long.dropna(subset=['stride_SD', 'genotype', 'rod_speed', 'trial'])
-            # --- Step 3: Fit mixed-effects model ---
-            # Random intercept per subject
-            model = smf.mixedlm("stride_SD ~ genotype * rod_speed * trial", data=df_clean, groups=df_clean["subject"])
-            result = model.fit()
-            pvals = result.pvalues
-
-            # Safe lookups for each effect of interest
-            def get_p(name):
-                return pvals.get(name, np.nan)
-
-            p_genotype = get_p('genotype[T.KO]')
-            p_genotype_speed = get_p('genotype[T.KO]:rod_speed')
-            p_trial = get_p('trial')
-            p_genotype_trial = get_p('genotype[T.KO]:trial')
-
-
-            # data_3d: shape (nSubjects, nTrials, nSpeeds)
-            # genotype: list of 'WT' or 'KO', length nSubjects
-            # plot_speed: array of speeds
-
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
-
-            plt.figure(figsize=(15, 8))
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
-
-            # 1️⃣ Left plot: rod_speed
-            ax1 = plt.subplot(1, 2, 1)
-            for g in genotypes_unique:
-                df_g = df_clean[df_clean['genotype'] == g]
-                grouped = df_g.groupby('rod_speed')['stride_SD']
-                mean_vals = grouped.mean()
-                ste_vals = grouped.std() / np.sqrt(grouped.count())
-                ax1.plot(mean_vals.index, mean_vals.values, color=colors[g], label=g, linewidth=2)
-                ax1.fill_between(mean_vals.index,
-                                mean_vals - ste_vals,
-                                mean_vals + ste_vals,
-                                color=colors[g], alpha=0.3)
-
-            ax1.set_xlabel('Rod speed')
-            ax1.set_ylabel('Stride amplitude SD (mean ± STE)')
-            ax1.set_title('Stride variability ' + key + ' vs rod speed')
-            ax1.legend()
-            ax1.spines['top'].set_visible(False)
-            ax1.spines['right'].set_visible(False)
-            ax1.text(0.95, 0.95,
-                    f'Genotype p = {p_genotype:.3e}\nGenotype×Speed p = {p_genotype_speed:.3e}',
-                    transform=ax1.transAxes, fontsize=20, ha='right', va='top',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
-
-            # 2️⃣ Right plot: trial
-            ax2 = plt.subplot(1, 2, 2)
-            for g in genotypes_unique:
-                df_g = df_clean[df_clean['genotype'] == g]
-                grouped = df_g.groupby('trial')['stride_SD']
-                mean_vals = grouped.mean()
-                ste_vals = grouped.std() / np.sqrt(grouped.count())
-                ax2.plot(mean_vals.index, mean_vals.values, color=colors[g], linewidth=2)
-                ax2.fill_between(mean_vals.index,
-                                mean_vals - ste_vals,
-                                mean_vals + ste_vals,
-                                color=colors[g], alpha=0.3)
-
-            ax2.set_xlabel('Trial')
-            #ax2.set_ylabel('Stride amplitude SD (mean ± STE)')
-            ax2.set_title('Stride variability ' + key + ' vs trial')
-            ax2.spines['top'].set_visible(False)
-            ax2.spines['right'].set_visible(False)
-            ax2.text(0.95, 0.95,
-                    f'Trial p = {p_trial:.3e}\nGenotype×Trial p = {p_genotype_trial:.3e}',
-                    transform=ax2.transAxes, fontsize=20, ha='right', va='top',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
-
-            plt.tight_layout()
-            plt.show()
-
-            savefigpath = os.path.join(self.sumFolder, 'Changes of ' + key + ' Amplitude SD.png')
-            plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + ' Amplitude SD.svg')
-            plt.savefig(savefigpath, format='svg')
-
-        #%% plot average frequency and amplitude vs rod speed
-        for key in bp_keys:
-
-            # Example dimensions
-            data_3d = running_amp_matrix[key]  # shape: nSubjects x nTrials x nSpeeds
-            nSubjects, nTrials, nSpeeds = data_3d.shape
-
-            # --- Step 1: Average over trials per subject ---
-            mean_per_subject = np.nanmean(data_3d, axis=1)  # shape: nSubjects x nSpeeds
-
-            rows = []
-            for i in range(nSubjects):
-                for t in range(nTrials):
-                    for s in range(nSpeeds):
-                        rows.append({
-                            'subject': f'subj_{i}',
-                            'genotype': genotype[i],
-                            'trial': t+1,                 # trial as factor
-                            'rod_speed': plot_speed[s],
-                            'stride_SD': data_3d[i, t, s]
-                        })
-
-            df_long = pd.DataFrame(rows)
-            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'KO'])
-
-            # --- Step 0: Drop rows with NaN in relevant columns ---
-            df_clean = df_long.dropna(subset=['stride_SD', 'genotype', 'rod_speed', 'trial'])
-            # --- Step 3: Fit mixed-effects model ---
-            # Random intercept per subject
-            model = smf.mixedlm("stride_SD ~ genotype * rod_speed * trial", data=df_clean, groups=df_clean["subject"])
-            result = model.fit()
-            pvals = result.pvalues
-
-            # Safe lookups for each effect of interest
-            def get_p(name):
-                return pvals.get(name, np.nan)
-
-            p_genotype = get_p('genotype[T.KO]')
-            p_genotype_speed = get_p('genotype[T.KO]:rod_speed')
-            p_trial = get_p('trial')
-            p_genotype_trial = get_p('genotype[T.KO]:trial')
-
-
-            # data_3d: shape (nSubjects, nTrials, nSpeeds)
-            # genotype: list of 'WT' or 'KO', length nSubjects
-            # plot_speed: array of speeds
-
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
-
-            plt.figure(figsize=(15, 8))
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
-
-            # 1️⃣ Left plot: rod_speed
-            ax1 = plt.subplot(1, 2, 1)
-            for g in genotypes_unique:
-                df_g = df_clean[df_clean['genotype'] == g]
-                grouped = df_g.groupby('rod_speed')['stride_SD']
-                mean_vals = grouped.mean()
-                ste_vals = grouped.std() / np.sqrt(grouped.count())
-                ax1.plot(mean_vals.index, mean_vals.values, color=colors[g], label=g, linewidth=2)
-                ax1.fill_between(mean_vals.index,
-                                mean_vals - ste_vals,
-                                mean_vals + ste_vals,
-                                color=colors[g], alpha=0.3)
-
-            ax1.set_xlabel('Rod speed')
-            ax1.set_ylabel('Stride amplitude (mean ± STE)')
-            ax1.set_title('Stride amplitude ' + key + ' vs rod speed')
-            ax1.legend()
-            ax1.spines['top'].set_visible(False)
-            ax1.spines['right'].set_visible(False)
-            ax1.text(0.95, 0.95,
-                    f'Genotype p = {p_genotype:.3e}\nGenotype×Speed p = {p_genotype_speed:.3e}',
-                    transform=ax1.transAxes, fontsize=20, ha='right', va='top',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
-
-            # 2️⃣ Right plot: trial
-            ax2 = plt.subplot(1, 2, 2)
-            for g in genotypes_unique:
-                df_g = df_clean[df_clean['genotype'] == g]
-                grouped = df_g.groupby('trial')['stride_SD']
-                mean_vals = grouped.mean()
-                ste_vals = grouped.std() / np.sqrt(grouped.count())
-                ax2.plot(mean_vals.index, mean_vals.values, color=colors[g], linewidth=2)
-                ax2.fill_between(mean_vals.index,
-                                mean_vals - ste_vals,
-                                mean_vals + ste_vals,
-                                color=colors[g], alpha=0.3)
-
-            ax2.set_xlabel('Trial')
-            #ax2.set_ylabel('Stride amplitude SD (mean ± STE)')
-            ax2.set_title('Average stride amplitude ' + key + ' vs trial')
-            ax2.spines['top'].set_visible(False)
-            ax2.spines['right'].set_visible(False)
-            ax2.text(0.95, 0.95,
-                    f'Trial p = {p_trial:.3e}\nGenotype×Trial p = {p_genotype_trial:.3e}',
-                    transform=ax2.transAxes, fontsize=20, ha='right', va='top',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
-
-            plt.tight_layout()
-            plt.show()
-
-            savefigpath = os.path.join(self.sumFolder, 'Changes of ' + key + ' Average Amplitude.png')
-            plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + 'Average Amplitude.svg')
-            plt.savefig(savefigpath, format='svg')
-
-        for key in bp_keys:
-
-            # Example dimensions
-            data_3d = running_freq_matrix[key]  # shape: nSubjects x nTrials x nSpeeds
-            nSubjects, nTrials, nSpeeds = data_3d.shape
-
-            # --- Step 1: Average over trials per subject ---
-            mean_per_subject = np.nanmean(data_3d, axis=1)  # shape: nSubjects x nSpeeds
-
-            rows = []
-            for i in range(nSubjects):
-                for t in range(nTrials):
-                    for s in range(nSpeeds):
-                        rows.append({
-                            'subject': f'subj_{i}',
-                            'genotype': genotype[i],
-                            'trial': t+1,                 # trial as factor
-                            'rod_speed': plot_speed[s],
-                            'stride_SD': data_3d[i, t, s]
-                        })
-
-            df_long = pd.DataFrame(rows)
-            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'KO'])
-
-            # --- Step 0: Drop rows with NaN in relevant columns ---
-            df_clean = df_long.dropna(subset=['stride_SD', 'genotype', 'rod_speed', 'trial'])
-            # --- Step 3: Fit mixed-effects model ---
-            # Random intercept per subject
-            model = smf.mixedlm("stride_SD ~ genotype * rod_speed * trial", data=df_clean, groups=df_clean["subject"])
-            result = model.fit()
-            pvals = result.pvalues
-
-            # Safe lookups for each effect of interest
-            def get_p(name):
-                return pvals.get(name, np.nan)
-
-            p_genotype = get_p('genotype[T.KO]')
-            p_genotype_speed = get_p('genotype[T.KO]:rod_speed')
-            p_trial = get_p('trial')
-            p_genotype_trial = get_p('genotype[T.KO]:trial')
-
-
-            # data_3d: shape (nSubjects, nTrials, nSpeeds)
-            # genotype: list of 'WT' or 'KO', length nSubjects
-            # plot_speed: array of speeds
-
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
-
-            plt.figure(figsize=(15, 8))
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
-
-            # 1️⃣ Left plot: rod_speed
-            ax1 = plt.subplot(1, 2, 1)
-            for g in genotypes_unique:
-                df_g = df_clean[df_clean['genotype'] == g]
-                grouped = df_g.groupby('rod_speed')['stride_SD']
-                mean_vals = grouped.mean()
-                ste_vals = grouped.std() / np.sqrt(grouped.count())
-                ax1.plot(mean_vals.index, mean_vals.values, color=colors[g], label=g, linewidth=2)
-                ax1.fill_between(mean_vals.index,
-                                mean_vals - ste_vals,
-                                mean_vals + ste_vals,
-                                color=colors[g], alpha=0.3)
-
-            ax1.set_xlabel('Rod speed')
-            ax1.set_ylabel('Stride frequency (mean ± STE)')
-            ax1.set_title('Stride frequency ' + key + ' vs rod speed')
-            ax1.legend()
-            ax1.spines['top'].set_visible(False)
-            ax1.spines['right'].set_visible(False)
-            ax1.text(0.95, 0.95,
-                    f'Genotype p = {p_genotype:.3e}\nGenotype×Speed p = {p_genotype_speed:.3e}',
-                    transform=ax1.transAxes, fontsize=20, ha='right', va='top',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
-
-            # 2️⃣ Right plot: trial
-            ax2 = plt.subplot(1, 2, 2)
-            for g in genotypes_unique:
-                df_g = df_clean[df_clean['genotype'] == g]
-                grouped = df_g.groupby('trial')['stride_SD']
-                mean_vals = grouped.mean()
-                ste_vals = grouped.std() / np.sqrt(grouped.count())
-                ax2.plot(mean_vals.index, mean_vals.values, color=colors[g], linewidth=2)
-                ax2.fill_between(mean_vals.index,
-                                mean_vals - ste_vals,
-                                mean_vals + ste_vals,
-                                color=colors[g], alpha=0.3)
-
-            ax2.set_xlabel('Trial')
-            #ax2.set_ylabel('Stride amplitude SD (mean ± STE)')
-            ax2.set_title('Average stride frequency ' + key + ' vs trial')
-            ax2.spines['top'].set_visible(False)
-            ax2.spines['right'].set_visible(False)
-            ax2.text(0.95, 0.95,
-                    f'Trial p = {p_trial:.3e}\nGenotype×Trial p = {p_genotype_trial:.3e}',
-                    transform=ax2.transAxes, fontsize=20, ha='right', va='top',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
-
-            plt.tight_layout()
-            plt.show()
-
-            savefigpath = os.path.join(self.sumFolder, 'Changes of ' + key + ' Average Frequency.png')
-            plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + 'Average Frequency.svg')
-            plt.savefig(savefigpath, format='svg')
-
-        #%% plot average correlation vs rod speed for different genotype
-        for key in corr_keys:
-
-            # Example dimensions
-            data_3d = corr_summary_matrix[key]  # shape: nSubjects x nTrials x nSpeeds
-            nSubjects, nTrials, nSpeeds = data_3d[1].shape
-            plot_speed = data_3d[0] # x axis
-            # --- Step 1: Average over trials per subject ---
-            mean_per_subject = np.nanmean(data_3d[1], axis=1)  # shape: nSubjects x nSpeeds
-
-            rows = []
-            for i in range(nSubjects):
-                for t in range(nTrials):
-                    for s in range(nSpeeds):
-                        rows.append({
-                            'subject': f'subj_{i}',
-                            'genotype': genotype[i],
-                            'trial': t+1,                 # trial as factor
-                            'rod_speed': plot_speed[s],
-                            'dependentVar': data_3d[1][i, t, s]
-                        })
-
-            df_long = pd.DataFrame(rows)
-            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'KO'])
-
-            # --- Step 0: Drop rows with NaN in relevant columns ---
-            df_clean = df_long.dropna(subset=['dependentVar', 'genotype', 'rod_speed', 'trial'])
-            # --- Step 3: Fit mixed-effects model ---
-            # Random intercept per subject
-            model = smf.mixedlm("dependentVar ~ genotype * rod_speed * trial", data=df_clean, groups=df_clean["subject"])
-            result = model.fit()
-            pvals = result.pvalues
-            print(result.summary())
-            # Safe lookups for each effect of interest
-            def get_p(name):
-                return pvals.get(name, np.nan)
-
-            p_genotype = get_p('genotype[T.KO]')
-            p_genotype_speed = get_p('genotype[T.KO]:rod_speed')
-            p_trial = get_p('trial')
-            p_genotype_trial = get_p('genotype[T.KO]:trial')
-
-
-            # data_3d: shape (nSubjects, nTrials, nSpeeds)
-            # genotype: list of 'WT' or 'KO', length nSubjects
-            # plot_speed: array of speeds
-
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
-
-            plt.figure(figsize=(15, 8))
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
-
-            # 1️⃣ Left plot: rod_speed
-            ax1 = plt.subplot(1, 2, 1)
-            for g in genotypes_unique:
-                df_g = df_clean[df_clean['genotype'] == g]
-                grouped = df_g.groupby('rod_speed')['dependentVar']
-                mean_vals = grouped.mean()
-                ste_vals = grouped.std() / np.sqrt(grouped.count())
-                ax1.plot(mean_vals.index, mean_vals.values, color=colors[g], label=g, linewidth=2)
-                ax1.fill_between(mean_vals.index,
-                                mean_vals - ste_vals,
-                                mean_vals + ste_vals,
-                                color=colors[g], alpha=0.3)
-
-            ax1.set_xlabel('Rod speed')
-            ax1.set_ylabel(key+' (mean ± STE)')
-            ax1.set_title(key + ' vs rod speed')
-            ax1.legend()
-            ax1.spines['top'].set_visible(False)
-            ax1.spines['right'].set_visible(False)
-            ax1.text(0.95, 0.95,
-                    f'Genotype p = {p_genotype:.3e}\nGenotype×Speed p = {p_genotype_speed:.3e}',
-                    transform=ax1.transAxes, fontsize=20, ha='right', va='top',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
-
-            # 2️⃣ Right plot: trial
-            ax2 = plt.subplot(1, 2, 2)
-            for g in genotypes_unique:
-                df_g = df_clean[df_clean['genotype'] == g]
-                grouped = df_g.groupby('trial')['dependentVar']
-                mean_vals = grouped.mean()
-                ste_vals = grouped.std() / np.sqrt(grouped.count())
-                ax2.plot(mean_vals.index, mean_vals.values, color=colors[g], linewidth=2)
-                ax2.fill_between(mean_vals.index,
-                                mean_vals - ste_vals,
-                                mean_vals + ste_vals,
-                                color=colors[g], alpha=0.3)
-
-            ax2.set_xlabel('Trial')
-            #ax2.set_ylabel('Stride amplitude SD (mean ± STE)')
-            ax2.set_title(key + ' vs trial')
-            ax2.spines['top'].set_visible(False)
-            ax2.spines['right'].set_visible(False)
-            ax2.text(0.95, 0.95,
-                    f'Trial p = {p_trial:.3e}\nGenotype×Trial p = {p_genotype_trial:.3e}',
-                    transform=ax2.transAxes, fontsize=20, ha='right', va='top',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
-
-            plt.tight_layout()
-            plt.show()
-
-            savefigpath = os.path.join(self.sumFolder, 'Changes of ' + key + '.png')
-            plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + '.svg')
-            plt.savefig(savefigpath, format='svg')
-
-        #%% plot average amplitude/frequency at 5-20 RPM within trial 1-3, 4-6, 7-9, and 10-12
-        
-
-    def process_for_moseq(self):
-        # stride analysis for rotarod behavior
-        # in situations where individual syllables jumped to the opposite side
-        # infer the coordinate with previous and post frames
-        # also remove the part when animal turns around
-
-        savefilefolder = os.path.join(self.rootFolder,'DLCforMoseq')
-        saveorigfolder = os.path.join(self.rootFolder, 'DLCforMoseq_origTS')
-        if not os.path.exists(savefilefolder):
-            os.makedirs(savefilefolder)
-        if not os.path.exists(saveorigfolder):
-            os.makedirs(saveorigfolder)
-
-        for idx, obj in tqdm(enumerate(self.data['DLC_obj'])):
+                    tStart = obj.data['time'][tInterval[0]]
+                    tEnd = obj.data['time'][tInterval[1]]
+                    if tEnd<obj.data['time'][len(obj.data['time'])-1]:
+                        turning_chunks.append((tStart, tEnd))
+
+
+                for sSpeed in startSpeed:
+                    if max(rodSpeed['smoothed']) > sSpeed:
+                        timeStart = rodSpeed['time'][rodSpeed['smoothed']>sSpeed].iloc[0]
+                        if max(rodSpeed['smoothed']) > sSpeed + 10:
+                            timeEnd = rodSpeed['time'][rodSpeed['smoothed']>sSpeed+10].iloc[0]
+                        else:
+                            timeEnd = rodSpeed['time'][rodSpeed['smoothed'] > sSpeed].iloc[-1]
+                        tempMask = np.logical_and(stride['time']>=timeStart,
+                                                  stride['time']<timeEnd)
+                        timeMask = np.logical_and(tempMask, ~np.isnan(truncatedStride['left hand']))
+                        corrcoeff={}
+                        corrcoeff['hands'] = np.corrcoef(stride['left hand'][timeMask],stride['right hand'][timeMask])[0,1]
+                        corrcoeff['feet'] = np.corrcoef(stride['left foot'][timeMask],stride['right foot'][timeMask])[0,1]
+                        corrcoeff['left'] = np.corrcoef(stride['left hand'][timeMask],stride['left foot'][timeMask])[0,1]
+                        corrcoeff['right'] = np.corrcoef(stride['right hand'][timeMask],stride['right foot'][timeMask])[0,1]
+                        for key in keys:
+                            average_xcorr[key][animalIdx, trialIdx, sSpeed//10] = corrcoeff[key]
+
+        #%% 10-20 rpm correlation - time on rod
+                #         # scatter plot of time on rod and average correlation coefficient
+                # plot_kp = ['hands', 'feet', 'left', 'right']
+                # for kpIdx, kp in enumerate(plot_kp):
+                #     for idx,animal in enumerate(self.animals):
+                #         cmap = get_cmap('viridis')  # Choose any Matplotlib colormap
+                #
+                #                         # Sample 12 evenly spaced colors from the colormap
+                #         colors = cmap(np.linspace(0, 1, nTrials))
+                #
+                #         # plt.figure()
+                #         for tt in range(nTrials):
+                #             plt.scatter(average_xcorr[kp][idx,tt,0],
+                #                     self.data['TimeOnRod'][np.logical_and(self.data['Animal']==animal,
+                #                     self.data['Trial']==tt+1)],
+                #                     c = colors[tt],label = str(tt+1))
+                #             plt.ylim([0, 300])
+                #             plt.xlim([-1, 1])
+                #             plt.xlabel('correlation coefficient in 10-20 rpm')
+                #             plt.ylabel('time on rod [s]')
+                #             plt.legend()
+                #             plt.title('Animal ' + animal + ' ' + kp)
+                #
+                #             plt.savefig(os.path.join(self.sumFolder, 'timeOnRod-correlation_coefficient(10-20 ' + animal + ' ' + kp + ').png'))
+
+                # calculate the correlation coefficent between performance and bodypart correlation
+                # for each animal
+                # pearsonCorr_perfMove =np.full((self.nSubjects, len(plot_kp), len(startSpeed)),np.nan)
+                # for kpIdx, kp in enumerate(plot_kp):
+                #     for idx, animal in enumerate(self.animals):
+                #         for tt in range(len(startSpeed)):
+                #             # if nanNaN values more than 6 trials
+                #             if np.sum(np.isnan(average_xcorr[kp][idx, :, tt])) < 6:
+                #                 notnanIndex = ~np.isnan(average_xcorr[kp][idx, :, tt])
+                #                 pearsonCorr_perfMove[idx, kpIdx, tt] = np.corrcoef(average_xcorr[kp][idx, notnanIndex, tt],
+                #                                  self.data['TimeOnRod'][self.data['Animal'] == animal][notnanIndex])[0, 1]
+                #
+                # # boxplot pearson correlation in different genotype
+                #         # RPM bin labels
+                # rpm_bins = ['10–20 rpm', '20–30 rpm', '30–40 rpm', '40–50 rpm', '50–60 rpm']
+                #
+                # for kpIdx, kp in enumerate(plot_kp):
+                #
+                #     df = pd.DataFrame(pearsonCorr_perfMove[:,kpIdx,0:5], columns=rpm_bins)
+                #     df['Genotype'] = self.GeneBG
+                #     df['Animal'] = [f'Animal_{i + 1}' for i in range(7)]
+                #
+                #     # Melt to long format
+                #     df_melted = df.melt(id_vars=['Animal', 'Genotype'],
+                #                         var_name='RPM_bin',
+                #                         value_name='Correlation')
+                #     # Define color palette
+                #     palette = {'WT': 'blue', 'KO': 'red'}
+                #
+                #     fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharey=True)
+                #     axes = axes.flatten()
+                #
+                #     for i, cond in enumerate(df_melted['RPM_bin'].unique()):
+                #         ax = axes[i]
+                #         sns.boxplot(
+                #             data=df_melted[df_melted['RPM_bin'] == cond],
+                #             x='Genotype',
+                #             y='Correlation',
+                #             ax=ax,
+                #             palette=palette,
+                #             width=0.3,
+                #             linewidth=2.0,
+                #             fliersize=0,  # Hide outlier dots
+                #             boxprops=dict(alpha=0.8),  # Slight transparency
+                #             medianprops=dict(color='black', linewidth=2)
+                #         )
+                #
+                #         ax.spines['top'].set_visible(False)
+                #         ax.spines['right'].set_visible(False)
+                #         ax.set_title(cond)
+                #
+                #     plt.tight_layout()
+                #     plt.show()
+                #     fig.suptitle('Performance - movement correlation ' + kp)
+                #
+                #     plt.savefig(os.path.join(self.sumFolder, 'performance-movement-correlation ' + kp + '.png'))
+                #     fig.savefig(os.path.join(self.sumFolder, 'performance-movement-correlation ' + kp + '.svg'), format='svg', bbox_inches='tight')
+
+                #%% running correlation within a speed window,
+                # cross correlation and lags in a short time period
+                running_xcorr = {}
+                running_lag = {}
+                running_pcorr={}
+                keys = ['hands', 'feet', 'left', 'right']
+                window_size = 2 # 2 second window
+                timeStep = 0.1
+                maxLength = int(np.ceil((max(stride['time'])-window_size)/timeStep))
+                running_time = np.arange(0, maxLength)*timeStep + window_size/2
+
+                for key in keys:
+                    running_xcorr[key] = np.full((maxLength,1),np.nan)
+                    running_lag[key] = np.full((maxLength,1), np.nan)
+                    running_pcorr[key] = np.full((maxLength,1),np.nan)
+
+                for iidx in range(maxLength):
+                    tStart = running_time[iidx]-window_size/2
+                    tEnd = running_time[iidx] + window_size/2
+
+                    tempMask = np.logical_and(stride['time']>=tStart,
+                                                  stride['time']<tEnd)
+                    timeMask = np.logical_and(tempMask, ~np.isnan(truncatedStride['left hand']))
+
+                            # calculate the running correlation coefficient and lags
+                    running_xcorr['hands'][iidx], running_lag['hands'][iidx] = cross_correlation(
+                        stride['left hand'][timeMask],stride['right hand'][timeMask])
+                    running_xcorr['feet'][iidx], running_lag['feet'][iidx] = cross_correlation(
+                        stride['left foot'][timeMask], stride['right foot'][timeMask])
+                    running_xcorr['left'][iidx], running_lag['left'][iidx] = cross_correlation(
+                        stride['left foot'][timeMask], stride['left hand'][timeMask])
+                    running_xcorr['right'][iidx], running_lag['right'][iidx] = cross_correlation(
+                        stride['right foot'][timeMask], stride['right hand'][timeMask])
+                    running_pcorr['hands'][iidx] = np.corrcoef(stride['left hand'][timeMask],stride['right hand'][timeMask])[0,1]
+                    running_pcorr['feet'][iidx] = np.corrcoef(stride['left foot'][timeMask], stride['right foot'][timeMask])[0,1]
+                    running_pcorr['left'][iidx] = np.corrcoef(stride['left foot'][timeMask], stride['left hand'][timeMask])[0,1]
+                    running_pcorr['right'][iidx] = np.corrcoef(stride['right foot'][timeMask], stride['right hand'][timeMask])[0,1]
+
+                # convert lag to seconds
+                for bp in keys:
+                    running_lag[bp] = running_lag[bp] / self.fps
+
+                #%% calculate the amplitude of the stride
+
+                maxima_indices_left = find_peaks(stride['left foot'],prominence=0.5)[0]
+                minima_indices_left = find_peaks(-stride['left foot'], prominence=0.5)[0]
+
+                # exclude the wrong-facing direction
+                allIndex= np.arange(0, len(stride['left foot']))
+                maxima_included_left = np.sort(list(set(maxima_indices_left) & set(allIndex[~np.isnan(truncatedStride['left hand'])])))
+                minima_included_left = np.sort(list(set(minima_indices_left) & set(allIndex[~np.isnan(truncatedStride['left hand'])])))
+
+                maxima_indices_right = find_peaks(stride['right foot'],prominence=0.5)[0]
+                minima_indices_right = find_peaks(-stride['right foot'], prominence=0.5)[0]
+
+                # exclude the wrong-facing direction
+                allIndex= np.arange(0, len(stride['left foot']))
+                maxima_included_right = np.sort(list(set(maxima_indices_right) & set(allIndex[~np.isnan(truncatedStride['left hand'])])))
+                minima_included_right = np.sort(list(set(minima_indices_right) & set(allIndex[~np.isnan(truncatedStride['left hand'])])))
+
+                # calculate the amplitue of stride at minima time point
+                step_amp = {}
+                step_time = {}
+                step_freq = {}
+                step_amp['left'] = []
+                step_amp['right'] = []
+                step_time['left'] = []
+                step_time['right'] = []
+                step_freq['left'] = []
+                step_freq['right'] = []
+                for maxi in maxima_included_left:
+                    # find the next local minima
+                    tempIdx = np.where(minima_included_left>maxi)[0]
+                    minIdx = tempIdx[0] if tempIdx.size > 0 else -1
+                    mini = minima_included_left[minIdx]
+
+                    # check if local minima and maxima is continuous
+                    if sum(np.isnan(truncatedStride['left foot'][maxi:mini])) ==0:
+                        step_time['left'].append(stride['time'][maxi])
+                        step_amp['left'].append(stride['left foot'][maxi] - stride['left foot'][mini])
+
+                for maxi in maxima_included_right:
+                    # find the next local minima
+                    tempIdx = np.where(minima_included_right>maxi)[0]
+                    minIdx = tempIdx[0] if tempIdx.size > 0 else -1
+                    mini = minima_included_right[minIdx]
+
+                    # check if local minima and maxima is continuous
+                    if sum(np.isnan(truncatedStride['right foot'][maxi:mini])) ==0:
+                        step_time['right'].append(stride['time'][maxi])
+                        step_amp['right'].append(stride['right foot'][maxi] - stride['right foot'][mini])
+
+                # calculate running step frequency in 2 seconds# seconds
+                step_size = 0.1
+                start_time = window_size/2
+                end_time = stride['time'][len(stride['time'])-1]-window_size/2
+                window_centers = np.arange(start_time, end_time, step_size)
+
+                # Count events in each 2-second bin
+                frequencies = {}
+                frequencies['left'] = []
+                frequencies['right'] = []
+                amp_average = {}
+                amp_average['left'] = []
+                amp_average['right'] = []
+
+                for center in window_centers:
+                    window_start = center - window_size/2
+                    window_end = center + window_size/2
+
+                    # check if there is turning period in the window
+                    if_setnan = 0# set value to nan if the time window falls fully in turning_peirod
+                    for turn in turning_chunks:
+                        if not (turn[0]>window_end or turn[1]< window_start):
+                            if_setnan = 1
+                            break
+                    if if_setnan == 1:
+                            frequencies['left'].append(np.nan)
+                            frequencies['right'].append(np.nan)
+                            amp_average['left'].append(np.nan)
+                            amp_average['right'].append(np.nan)
+
+                    else:
+                        count_left = np.sum((step_time['left'] >= window_start) & (step_time['left'] < window_end))
+                        frequencies['left'].append(count_left / (window_size))  # frequency in Hz
+                        count_right = np.sum((step_time['right'] >= window_start) & (step_time['right'] < window_end))
+                        frequencies['right'].append(count_right / (window_size))  # frequency in Hz
+                        steps_in_left = np.array(step_amp['left'])[(step_time['left'] >= window_start) & (step_time['left'] < window_end)]
+                        steps_in_right = np.array(step_amp['right'])[
+                            (step_time['right'] >= window_start) & (step_time['right'] < window_end)]
+                        amp_average['left'].append(np.mean(steps_in_left))
+                        amp_average['right'].append(np.mean(steps_in_right))
+
+                frequencies['left'] = np.array(frequencies['left'])
+                frequencies['right'] = np.array(frequencies['right'])
+                amp_average['left'] = np.array(amp_average['left'])
+                amp_average['right'] = np.array(amp_average['right'])
+
+                # calculate running standard deviation in 2s window for average frequency and amplitude
+                freq_std = {}
+                freq_std['left'] = []
+                freq_std['right'] = []
+                amp_std = {}
+                amp_std['left'] = []
+                amp_std['right'] = []
+                window_size_std = 10
+                for center in window_centers:
+                    window_start = center - window_size_std /2
+                    window_end = center + window_size_std /2
+                    freq_std['left'].append(np.nanstd(frequencies['left'][np.logical_and(window_centers >= window_start,
+                                                                                         window_centers < window_end)]))  # frequency in Hz
+                    freq_std['right'].append(np.nanstd(frequencies['right'][np.logical_and(window_centers >= window_start,
+                                                                                         window_centers < window_end)]))
+                    amp_std['left'].append(np.nanstd(np.array(step_amp['left'])[np.logical_and(step_time['left'] >= window_start,
+                                                                                     step_time['left'] < window_end)]))
+                    amp_std['right'].append(np.nanstd(np.array(step_amp['right'])[np.logical_and(step_time['right'] >= window_start,
+                                                                                     step_time['right'] < window_end)]))
+                # make a summary plot for
+                # 1. foot stride
+                # 2. foot correlation
+                # 3. foot lags
+                # 4. foot amplitude and frequency
+
+                # 1. foot stride
+                plt.figure()
+
+                plt.subplot(6,1,1)
+                plt.plot(rodSpeed['time'], rodSpeed['smoothed'])
+                ax = plt.gca()  # Get current axes
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.set_title('RPM for ASD' + animal + ' trial ' + str(trialIdx + 1))
+                ax.set_xlim(stride['time'][0], stride['time'][len(stride['time'])-1])
+                for tInt in turning_chunks:
+                    ax.axvspan(tInt[0], tInt[1], color='gray', alpha=0.3)
+
+                plt.subplot(6,1,2)
+                plt.plot(stride['time'], stride['left foot'])
+                plt.plot(stride['time'], stride['right foot'])
+                ax = plt.gca()  # Get current axes
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.set_title('Foot stride')
+                ax.legend(['left', 'right'],frameon=False)
+                ax.set_xlim(stride['time'][0], stride['time'][len(stride['time']) - 1])
+                for tInt in turning_chunks:
+                    ax.axvspan(tInt[0], tInt[1], color='gray', alpha=0.3)
+
+                plt.subplot(6,1,3)
+                plt.plot(running_time, running_xcorr['feet'])
+                plt.plot(running_time, running_pcorr['feet'])
+                ax = plt.gca()  # Get current axes
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.set_title('Running correlation between feet in 2s window')
+                ax.legend(['x-corr', 'p-corr'],frameon=False)
+                ax.set_xlim(stride['time'][0], stride['time'][len(stride['time']) - 1])
+                for tInt in turning_chunks:
+                    ax.axvspan(tInt[0], tInt[1], color='gray', alpha=0.3)
+
+                plt.subplot(6,1,4)
+                plt.stem(step_time['left'], step_amp['left'], linefmt='b-', markerfmt='bo', basefmt=' ')
+                plt.stem(step_time['right'], step_amp['right'], linefmt='orange', markerfmt='orange', basefmt=' ')
+                plt.plot(window_centers, amp_average['left'], color='black')
+                plt.plot(window_centers, amp_average['right'], color='red')
+                ax = plt.gca()  # Get current axes
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.set_title('Foot amplitude')
+                ax.legend(['left', 'right'], frameon=False)
+                ax.set_xlim(stride['time'][0], stride['time'][len(stride['time']) - 1])
+                for tInt in turning_chunks:
+                    ax.axvspan(tInt[0], tInt[1], color='gray', alpha=0.3)
+
+                plt.subplot(6,1,5)
+                plt.plot(window_centers, frequencies['left'])
+                plt.plot(window_centers, frequencies['right'])
+                ax = plt.gca()  # Get current axes
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.set_title('Foot frequency')
+                ax.legend(['left', 'right'], frameon=False)
+                ax.set_xlim(stride['time'][0], stride['time'][len(stride['time']) - 1])
+                for tInt in turning_chunks:
+                    ax.axvspan(tInt[0], tInt[1], color='gray', alpha=0.3)
+
+                plt.subplot(6,1,6)
+                plt.plot(window_centers, freq_std['left'])
+                plt.plot(window_centers, freq_std['right'])
+                ax = plt.gca()  # Get current axes
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.set_title('Foot frequency standard deviation')
+                ax.legend(['left', 'right'], frameon=False)
+                ax.set_xlim(stride['time'][0], stride['time'][len(stride['time']) - 1])
+                for tInt in turning_chunks:
+                    ax.axvspan(tInt[0], tInt[1], color='gray', alpha=0.3)
+
+                plt.tight_layout()
+                plt.show()
+
+                # save the figure and data
+                savefigpath = os.path.join(obj.analysis, 'Stride analysis.png')
+                plt.savefig(savefigpath)
+                plt.close()
+
+                savedatapath = os.path.join(obj.analysis, 'strideAnalysis.pickle')
+                savedata = {'running_time': running_time, 'running_xcorr': running_xcorr, 'running_pcorr': running_pcorr,
+                            'step_time': step_time, 'step_amp': step_amp, 'step_freq': step_freq,
+                            'freq_time':window_centers, 'frequencies':frequencies, 'amp_average': amp_average,
+                            'freq_std': freq_std, 'amp_std': amp_std,
+                            'turning_period': turning_chunks}
+
+                with open(savedatapath, 'wb') as f:
+                    pickle.dump(savedata, f)
+
+                   #%% average correlation for every 10 rpm ramp
+                # average trial 9-11?
+                # trialInclude = [9,10,11]
+                # for kpIdx, kp in enumerate(plot_kp):
+                #     for idx,animal in enumerate(self.animals):
+                #         plt.figure()
+                #         for tt in trialInclude:
+                #             plt.plot(startSpeed,average_xcorr[kp][idx,tt,:],label = 'Trial'+str(tt+1))
+                #         plt.xlim([startSpeed[0], startSpeed[-1]])
+                #         plt.ylim([-0.5, 1])
+                #         plt.xlabel('RPM')
+                #         plt.ylabel('Average correlation coefficient')
+                #         plt.title('Animal ' + animal + ' ' + kp)
+                #         plt.legend()
+                #         plt.savefig(os.path.join(self.sumFolder, 'correlation_coefficient in trial 10-12' + animal + ' ' + kp + ').png'))
+                #
+                # # summary plot
+                # for kpIdx, kp in enumerate(plot_kp):
+                #     for idx,animal in enumerate(self.animals):
+                #         plt.figure()
+                #         for tt in trialInclude:
+                #             plt.plot(startSpeed,average_xcorr[kp][idx,tt,:],label = 'Trial'+str(tt+1))
+                #         plt.xlim([startSpeed[0], startSpeed[-1]])
+                #         plt.ylim([-0.5, 1])
+                #         plt.xlabel('RPM')
+                #         plt.ylabel('Average correlation coefficient')
+                #         plt.title('Animal ' + animal + ' ' + kp)
+                #         plt.legend()
+                #         plt.savefig(os.path.join(self.sumFolder, 'correlation_coefficient in trial 10-12' + animal + ' ' + kp + ').png'))
+
+    def stride_summary(self):
+        """ summarize stride analysis:
+        1. average foot amplitude
+        2. average foot frequency
+        3. correlation?
+        """
+        nSubjects = len(self.animals)
+        nTrials = 12
+
+        average_foot_frequency_time = np.arange(1,320, 0.1)
+        average_foot_frequency_left = np.full((len(average_foot_frequency_time),nSubjects, nTrials),np.nan)
+        average_foot_frequency_right = np.full((len(average_foot_frequency_time), nSubjects, nTrials), np.nan)
+        average_foot_amplitude_left = np.full((len(average_foot_frequency_time), nSubjects, nTrials), np.nan)
+        average_foot_amplitude_right = np.full((len(average_foot_frequency_time), nSubjects, nTrials), np.nan)
+        freq_std_left = np.full((len(average_foot_frequency_time), nSubjects, nTrials), np.nan)
+        freq_std_right = np.full((len(average_foot_frequency_time), nSubjects, nTrials), np.nan)
+        amp_std_left = np.full((len(average_foot_frequency_time), nSubjects, nTrials), np.nan)
+        amp_std_right = np.full((len(average_foot_frequency_time), nSubjects, nTrials), np.nan)
+
+        for idx, obj in enumerate(self.data['DLC_obj']):
             animal = self.data['Animal'][idx]
-            trialIdx = self.data['Trial'][idx]
+            trialIdx = self.data['Trial'][idx]-1
             animalIdx = self.animals.index(animal)
 
             if self.data['DLC'][idx] is not None:
-                # process video
-                # remove the turning part, save the DLC and video 6in separate pieces
-                #obj = self.data['DLC_obj'][idx]
-                turning_mask = obj.data['turning_mask']
-                turning_segments = obj.data['turning_period']
-                # load the Stride_freq
-                orig_DLCCSV = self.data['DLC'][idx]
-                corrected_DLCCSV = os.path.join(self.dataFolder,'DLC_Corrected',os.path.basename(orig_DLCCSV)[:-4] + '_corrected.csv')
-                df = pd.read_csv(corrected_DLCCSV)
+                rodSpeedCSV = os.path.join(obj.analysis, 'smoothed_rodSpeed.csv')
+                rodSpeed = pd.read_csv(rodSpeedCSV)
 
-                # remove the first the last 5 seconds for frames without animal on the rod
-                timeStart = np.where(obj.data['time']>(obj.data['rodRun'][0]))[0][0] 
+                savedatapath = os.path.join(obj.analysis, 'strideAnalysis.pickle')
+                with open(savedatapath, 'rb') as f:
+                    data = pickle.load(f)
+
+                # average step frequency
+                # align the data at time 0s
+                freq_length = len(data['frequencies']['left'])
+                turning_mask_freq = np.full((freq_length,1),False)
+                turning_mask_leftstep = np.full((len(data['step_time']['left']),1), False)
+                turning_mask_rightstep = np.full((len(data['step_time']['right']),1), False)
+
+                # remove the turning period
+                for turn in data['turning_period']:
+                    turning_Idx = np.logical_and(data['freq_time']>=turn[0], data['freq_time']<turn[1])
+                    turning_leftstep = np.logical_and(data['step_time']['left']>=turn[0], data['step_time']['left']<turn[1])
+                    turning_rightstep = np.logical_and(data['step_time']['right']>=turn[0], data['step_time']['right']<turn[1])
+                    turning_mask_freq[turning_Idx] = True
+                    turning_mask_leftstep[turning_leftstep] = True
+                    turning_mask_rightstep[turning_rightstep] = True
+
+                tempdata = np.array(data['frequencies']['left'])
+                tempdata[turning_mask_freq[:,0]] = np.nan
+                average_foot_frequency_left[0:freq_length, animalIdx, trialIdx] = tempdata
+
+                tempdata = np.array(data['frequencies']['right'])
+                tempdata[turning_mask_freq[:,0]] = np.nan
+                average_foot_frequency_right[0:freq_length, animalIdx, trialIdx] = tempdata
+
+                tempdata = np.array(data['amp_average']['left'])
+                tempdata[turning_mask_freq[:,0]] = np.nan
+                average_foot_amplitude_left[0:freq_length, animalIdx, trialIdx] = tempdata
+
+                tempdata = np.array(data['amp_average']['right'])
+                tempdata[turning_mask_freq[:,0]] = np.nan
+                average_foot_amplitude_right[0:freq_length, animalIdx, trialIdx] = tempdata
+
+                tempdata = np.array(data['freq_std']['left'])
+                tempdata[turning_mask_freq[:,0]] = np.nan
+                freq_std_left[0:freq_length, animalIdx, trialIdx] = tempdata
+
+                tempdata = np.array(data['freq_std']['right'])
+                tempdata[turning_mask_freq[:,0]] = np.nan
+                freq_std_right[0:freq_length, animalIdx, trialIdx] = tempdata
+
+                tempdata = np.array(data['amp_std']['left'])
+                tempdata[turning_mask_freq[:,0]] = np.nan
+                amp_std_left[0:freq_length, animalIdx, trialIdx] = tempdata
+
+                tempdata = np.array(data['amp_std']['right'])
+                tempdata[turning_mask_freq[:,0]] = np.nan
+                amp_std_right[0:freq_length, animalIdx, trialIdx] = tempdata
+
+
+        #%% plot average step frequency in 12 trials
+        fig, axes = plt.subplots(3, 4, sharey=True, figsize=(20, 10))
+        WTMask = (self.GeneBG=='WT')
+        KOMask = (self.GeneBG=='KO')
+
+        for trial in range(nTrials):
+            plotx = trial//4
+            ploty = trial%4
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(average_foot_frequency_left[:, WTMask, trial],1),
+                             color = 'black', label = 'WT', linewidth = 2)
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(average_foot_frequency_left[:, KOMask, trial],1),
+                             color='red', label='WT', linewidth=2
+                             )
+            axes[plotx, ploty].spines['top'].set_visible(False)
+            axes[plotx, ploty].spines['right'].set_visible(False)
+            axes[plotx, ploty].set_title('Trial ' + str(trial+1))
+            axes[plotx, ploty].set_xlim([0, 320])
+        plt.tight_layout()
+        plt.show()
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Average left foot frequency in 12 trials.png')
+        plt.savefig(savefigname)
+
+        fig, axes = plt.subplots(3, 4, sharey=True, figsize=(20, 10))
+        WTMask = (self.GeneBG=='WT')
+        KOMask = (self.GeneBG=='KO')
+
+        for trial in range(nTrials):
+            plotx = trial//4
+            ploty = trial%4
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(average_foot_frequency_right[:, WTMask, trial],1),
+                             color = 'black', label = 'WT', linewidth = 2)
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(average_foot_frequency_right[:, KOMask, trial],1),
+                             color='red', label='WT', linewidth=2
+                             )
+            axes[plotx, ploty].spines['top'].set_visible(False)
+            axes[plotx, ploty].spines['right'].set_visible(False)
+            axes[plotx, ploty].set_title('Trial ' + str(trial+1))
+            axes[plotx, ploty].set_xlim([0, 320])
+        plt.tight_layout()
+        plt.show()
+
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Average right foot frequency in 12 trials.png')
+        plt.savefig(savefigname)
+
+        # plot foot amplitude
+        fig, axes = plt.subplots(3, 4, sharey=True, figsize=(20, 10))
+        WTMask = (self.GeneBG=='WT')
+        KOMask = (self.GeneBG=='KO')
+
+        for trial in range(nTrials):
+            plotx = trial//4
+            ploty = trial%4
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(average_foot_amplitude_left[:, WTMask, trial],1),
+                             color = 'black', label = 'WT', linewidth = 2)
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(average_foot_amplitude_left[:, KOMask, trial],1),
+                             color='red', label='WT', linewidth=2
+                             )
+            axes[plotx, ploty].spines['top'].set_visible(False)
+            axes[plotx, ploty].spines['right'].set_visible(False)
+            axes[plotx, ploty].set_title('Trial ' + str(trial+1))
+            axes[plotx, ploty].set_xlim([0, 320])
+            axes[plotx, ploty].set_ylim([0, 200])
+        plt.tight_layout()
+        plt.show()
+
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Average left foot amplitude in 12 trials.png')
+        plt.savefig(savefigname)
+
+        fig, axes = plt.subplots(3, 4, sharey=True, figsize=(20, 10))
+        WTMask = (self.GeneBG=='WT')
+        KOMask = (self.GeneBG=='KO')
+
+        for trial in range(nTrials):
+            plotx = trial//4
+            ploty = trial%4
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(average_foot_amplitude_right[:, WTMask, trial],1),
+                             color = 'black', label = 'WT', linewidth = 2)
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(average_foot_amplitude_right[:, KOMask, trial],1),
+                             color='red', label='WT', linewidth=2
+                             )
+            axes[plotx, ploty].spines['top'].set_visible(False)
+            axes[plotx, ploty].spines['right'].set_visible(False)
+            axes[plotx, ploty].set_title('Trial ' + str(trial+1))
+            axes[plotx, ploty].set_xlim([0, 320])
+            axes[plotx, ploty].set_ylim([0, 200])
+        plt.tight_layout()
+        plt.show()
+
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Average right foot amplitude in 12 trials.png')
+        plt.savefig(savefigname)
+
+        fig, axes = plt.subplots(3, 4, sharey=True, figsize=(20, 10))
+        WTMask = (self.GeneBG=='WT')
+        KOMask = (self.GeneBG=='KO')
+
+        for trial in range(nTrials):
+            plotx = trial//4
+            ploty = trial%4
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(amp_std_left[:, WTMask, trial],1),
+                             color = 'black', label = 'WT', linewidth = 2)
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(amp_std_left[:, KOMask, trial],1),
+                             color='red', label='WT', linewidth=2
+                             )
+            axes[plotx, ploty].spines['top'].set_visible(False)
+            axes[plotx, ploty].spines['right'].set_visible(False)
+            axes[plotx, ploty].set_title('Trial ' + str(trial+1))
+            axes[plotx, ploty].set_xlim([0, 320])
+            axes[plotx, ploty].set_ylim([0, 100])
+        plt.tight_layout()
+        plt.show()
+
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Average left foot amplitude standard deviation in 12 trials.png')
+        plt.savefig(savefigname)
+
+        fig, axes = plt.subplots(3, 4, sharey=True, figsize=(20, 10))
+        WTMask = (self.GeneBG=='WT')
+        KOMask = (self.GeneBG=='KO')
+
+        for trial in range(nTrials):
+            plotx = trial//4
+            ploty = trial%4
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(amp_std_right[:, WTMask, trial],1),
+                             color = 'black', label = 'WT', linewidth = 2)
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(amp_std_right[:, KOMask, trial],1),
+                             color='red', label='WT', linewidth=2
+                             )
+            axes[plotx, ploty].spines['top'].set_visible(False)
+            axes[plotx, ploty].spines['right'].set_visible(False)
+            axes[plotx, ploty].set_title('Trial ' + str(trial+1))
+            axes[plotx, ploty].set_xlim([0, 320])
+            axes[plotx, ploty].set_ylim([0, 100])
+        plt.tight_layout()
+        plt.show()
+
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Average right foot amplitude standard deviation in 12 trials.png')
+        plt.savefig(savefigname)
+
+        fig, axes = plt.subplots(3, 4, sharey=True, figsize=(20, 10))
+        WTMask = (self.GeneBG=='WT')
+        KOMask = (self.GeneBG=='KO')
+
+        for trial in range(nTrials):
+            plotx = trial//4
+            ploty = trial%4
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(freq_std_left[:, WTMask, trial],1),
+                             color = 'black', label = 'WT', linewidth = 2)
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(freq_std_left[:, KOMask, trial],1),
+                             color='red', label='WT', linewidth=2
+                             )
+            axes[plotx, ploty].spines['top'].set_visible(False)
+            axes[plotx, ploty].spines['right'].set_visible(False)
+            axes[plotx, ploty].set_title('Trial ' + str(trial+1))
+            axes[plotx, ploty].set_xlim([0, 320])
+            axes[plotx, ploty].set_ylim([0, 2.5])
+        plt.tight_layout()
+        #plt.show()
+
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Average left foot frequency standard deviation in 12 trials.png')
+        plt.savefig(savefigname)
+
+        # Right
+
+        fig, axes = plt.subplots(3, 4, sharey=True, figsize=(20, 10))
+        WTMask = (self.GeneBG=='WT')
+        KOMask = (self.GeneBG=='KO')
+
+        for trial in range(nTrials):
+            plotx = trial//4
+            ploty = trial%4
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(freq_std_right[:, WTMask, trial],1),
+                             color = 'black', label = 'WT', linewidth = 2)
+            axes[plotx, ploty].plot(average_foot_frequency_time, np.nanmean(freq_std_right[:, KOMask, trial],1),
+                             color='red', label='WT', linewidth=2
+                             )
+            axes[plotx, ploty].spines['top'].set_visible(False)
+            axes[plotx, ploty].spines['right'].set_visible(False)
+            axes[plotx, ploty].set_title('Trial ' + str(trial+1))
+            axes[plotx, ploty].set_xlim([0, 320])
+            axes[plotx, ploty].set_ylim([0, 2.5])
+        plt.tight_layout()
+        plt.show()
+
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Average right foot frequency standard deviation in 12 trials.png')
+        plt.savefig(savefigname)
+
+        fig,axes = plt.subplots(2,1)
+        animalList = np.arange(nSubjects)
+        WTID =  animalList[WTMask]
+        KOID = animalList[KOMask]
+        plotX = 1+np.arange(nTrials)
+
+        axes[0].plot(plotX, np.nanmean(np.nanmean(amp_std_left[:,WTMask,:],0),0), color='black',label = 'WT')
+        for wt in WTID:
+            axes[0].plot(plotX, np.nanmean(amp_std_left[:,wt,:],0), color='black',linewidth=0.5, alpha=0.3)
+        axes[0].plot(plotX, np.nanmean(np.nanmean(amp_std_left[:,KOMask,:],0),0), color='red',label = 'WT')
+        for ko in KOID:
+            axes[0].plot(plotX, np.nanmean(amp_std_left[:,ko,:],0), color='red',linewidth=0.5, alpha=0.3)
+        axes[0].spines['top'].set_visible(False)
+        axes[0].spines['right'].set_visible(False)
+        axes[0].set_title('Left foot amplitude standard deviation in 12 trials')
+
+
+        axes[1].plot(plotX, np.nanmean(np.nanmean(amp_std_right[:,WTMask,:],0),0), color='black',label = 'WT')
+        for wt in WTID:
+            axes[1].plot(plotX, np.nanmean(amp_std_right[:,wt,:],0), color='black',linewidth=0.5, alpha=0.3)
+        axes[1].plot(plotX, np.nanmean(np.nanmean(amp_std_right[:,KOMask,:],0),0), color='red',label = 'WT')
+        for ko in KOID:
+            axes[1].plot(plotX, np.nanmean(amp_std_right[:,ko,:],0), color='red',linewidth=0.5, alpha=0.3)
+        axes[1].spines['top'].set_visible(False)
+        axes[1].spines['right'].set_visible(False)
+        axes[1].set_title('Right foot amplitude standard deviation in 12 trials')
+        axes[1].set_xlabel('Trials')
+
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Average foot amplitude standard deviation over 12 trials.png')
+        plt.savefig(savefigname)
+        import matplotlib as mpl
+        mpl.rcParams['svg.fonttype'] = 'none'
+        svgname = os.path.join(self.rootFolder, 'Summary', 'Average foot amplitude standard deviation over 12 trials.svg')
+        plt.savefig(svgname, format='svg')
+        # plot the correlation between performance and step amplitude std
+
+        average_amp_std_left = np.nanmean(amp_std_left,0)
+        average_amp_std_left= average_amp_std_left.reshape(-1)
+        average_amp_std_right = np.nanmean(amp_std_right,0)
+        average_amp_std_right = average_amp_std_right.reshape(-1)
+
+        perf_csv = os.path.join(self.rootFolder,'Performance.csv')
+        perf_fall = pd.read_csv(perf_csv)
+        KOMask = np.array([True if self.data['GeneBG'][i]=='KO' else False for i in range(len(self.data['GeneBG']))])
+        performance =np.array([
+            self.data['TimeOnRod'][i] if perf_fall['Fall by turning'][i] == 0 else np.nan
+            for i in range(len(average_amp_std_right))
+        ])
+
+        fig, axes = plt.subplots(1,2)
+
+        axes[0].scatter(average_amp_std_left[KOMask],performance[KOMask], color='red')
+        axes[0].scatter(average_amp_std_left[~KOMask],performance[~KOMask], color='black')
+        axes[0].spines['top'].set_visible(False)
+        axes[0].spines['right'].set_visible(False)
+        axes[0].set_xlabel('Left foot amplitude standard deviation')
+        axes[0].set_ylabel('Performance')
+
+        axes[1].scatter(average_amp_std_right[KOMask],performance[KOMask], color='red')
+        axes[1].scatter(average_amp_std_right[~KOMask],performance[~KOMask], color='black')
+        axes[1].spines['top'].set_visible(False)
+        axes[1].spines['right'].set_visible(False)
+        axes[1].set_xlabel('Right foot amplitude standard deviation')
+
+        savefigname = os.path.join(self.rootFolder, 'Summary', 'Correlation betweeen performance and step variation.png')
+        plt.savefig(savefigname)
+        mpl.rcParams['svg.fonttype'] = 'none'
+        svgname = os.path.join(self.rootFolder, 'Summary', 'Correlation betweeen performance and step variation.svg')
+        plt.savefig(svgname, format='svg')
+
+    def process_for_moseq(self):
+        # cut the video and DLC labelling result to exclude empty frames
+
+        savefilefolder = os.path.join(self.rootFolder,'DLCforMoseq')
+        if not os.path.exists(savefilefolder):
+            os.makedirs(savefilefolder)
+        for idx, obj in enumerate(self.data['DLC_obj']):
+            animal = self.data['Animal'][idx]
+            trialIdx = self.data['Trial'][idx]-1
+            animalIdx = self.animals.index(animal)
+
+            # process DLC file
+            if self.data['DLC'][idx] is not None:
+                # load the Stride_freq
+                DLCCSV = self.data['DLC'][idx]
+                df = pd.read_csv(DLCCSV)
+
+                # for videos started recording after rod started to turn at 5 rpm
+                # take the video from the beginning
+                time0 = obj.data['rodRun'][0]
+                timeStart = np.where(obj.data['time']>time0)[0][0]
                 timeOnRod = self.data['TimeOnRod'][np.logical_and(self.data['Animal']==animal,
-                         self.data['Trial']==trialIdx)]
-                timeEnd = np.where(obj.data['time']<(obj.data['rodRun'][0]+timeOnRod-8)[idx])[0][-1] 
+                         self.data['Trial']==trialIdx+1)]
+                timeEnd = np.where(obj.data['time']<(time0+timeOnRod)[idx])[0][-1]
                 # isolate the time when animals turns around
                 tempMask = np.logical_and(pd.to_numeric(df['scorer'][2:])>timeStart, pd.to_numeric(df['scorer'][2:])<=timeEnd)
                 tempMask = [True, True]+ list(tempMask)
+                df_filtered = df[tempMask]
 
-                file_path = os.path.normpath(orig_DLCCSV)
+                file_path = os.path.normpath(DLCCSV)
 
                 # Extract the base filename without extension
                 filename = os.path.splitext(os.path.basename(file_path))[0]
+                savefilepath = os.path.join(savefilefolder, filename+'forMoseq.csv')
+                df_filtered.to_csv(savefilepath, index=False)
 
-                # go through turning segments to get a non-turning segments
-                non_turning_segments = []
-                if len(turning_segments) ==0:
-                    non_turning_segments.append((0, len(obj.data['time'])-1))
-                elif len(turning_segments) ==1:
-                    non_turning_segments.append((0, turning_segments[0][0]-100))
-                    non_turning_segments.append((turning_segments[0][1]+100, len(obj.data['time'])-1))
-                else:
-                    for turnIdx in range(len(turning_segments)):
-                        if turnIdx==0:
-                            start_frame = 0
-                        else:
-                            start_frame = turning_segments[turnIdx-1][1]+100
-                        if turnIdx == len(turning_segments)-1:
-                            end_frame = len(obj.data['time'])
-                        else:
-                            end_frame = turning_segments[turnIdx][0]-100  # remove about 1s before and after turning
-                        non_turning_segments.append((start_frame, end_frame))
+            # process video
+                videoPath = self.data['Video'][idx]
+                cap = cv2.VideoCapture(videoPath)
 
-                for turnIdx in range(len(non_turning_segments)):
-                    start_frame, end_frame = non_turning_segments[turnIdx]
-                    nonTurningMask = np.zeros(len(obj.data['time']), dtype=bool)
-                    nonTurningMask[start_frame:end_frame+1] = True
-                    nonTurningMask = [True, True]+ list(nonTurningMask)
-                    saveMask = np.logical_and(tempMask, nonTurningMask)
+                if not cap.isOpened():
+                    raise ValueError(f"Cannot open video file: {videoPath }")
+                fps = int(cap.get(cv2.CAP_PROP_FPS))
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for .mp4
 
-                    # check it is longer than 2 second
-                    if sum(saveMask) > 100 and start_frame<end_frame:
-                    # save the non-turning segment
-                        df_segment = df[saveMask]
-                        orig_index = df_segment.iloc[:,0].copy()
-                        # renumber it
-                        df_segment.iloc[2:,0] = np.arange(len(df_segment)-2)
+                # Create VideoWriter to save the new video
 
-                        savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
-                        df_segment.to_csv(savefilepath, index=False)
-                        savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
-                        orig_index.to_csv(savetimeStamp, index=False)
-                        # save the video segment
-                        mask = saveMask.astype(int)
+                savevideopath = os.path.join(savefilefolder, filename + 'forMoseq.mp4')
+                out = cv2.VideoWriter(savevideopath, fourcc, fps, (width, height))
+                # Start reading from the input video
+                frame_idx = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:  # End of video
+                        break
 
-                        ones_idx = np.where(mask[2:] == 1)[0]
+                    if timeStart <= frame_idx <= timeEnd:
+                        out.write(frame)
 
-                        start = ones_idx[0]
-                        end   = ones_idx[-1]
-                        videoPath = self.data['Video'][idx]
-                        #cap = cv2.VideoCapture(videoPath)
-                        container = av.open(videoPath)
-                        stream = container.streams.video[0]
-                            # Determine FPS
-                        fps = float(stream.average_rate)  # frames per second
-                        width = stream.codec_context.width
-                        height = stream.codec_context.height
+                    frame_idx += 1
 
-                        # Create output container and stream
-                        savevideopath_segment = os.path.join(savefilefolder, filename +f'_clip{turnIdx}.mp4')
-                        if not os.path.exists(savevideopath_segment):
+                    if frame_idx > timeEnd:  # Stop processing after end_frame
+                        break
 
-                            cap = cv2.VideoCapture(videoPath)
-                            fps = cap.get(cv2.CAP_PROP_FPS)
-                            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-                            # Use MJPG or XVID for AVI; use mp4v or H264 for MP4
-                            fourcc = cv2.VideoWriter_fourcc(*'XVID')  
-                            out = cv2.VideoWriter(savevideopath_segment, fourcc, fps, (width, height))
-
-                            frame_idx = 0
-                            while True:
-                                ret, frame = cap.read()
-                                if not ret:
-                                    break
-
-                                if frame_idx < start_frame:
-                                    frame_idx += 1
-                                    continue
-                                if frame_idx > end_frame:
-                                    break
-
-                                out.write(frame)
-                                frame_idx += 1
-
-                            cap.release()
-                            out.release()
-                            print(f"Saved frames {start_frame}-{end_frame} to {outputPath}")
-
-                            output_container = av.open(savevideopath_segment, mode='w')
-                            output_stream = output_container.add_stream('mpeg4', rate=fps)
-                            output_stream.width = width
-                            output_stream.height = height
-                            output_stream.pix_fmt = 'yuv420p'
-
-                            frame_counter = 0
-
-                            for packet in container.demux(video_stream):
-                                for frame in packet.decode():
-                                    if frame_counter < start_frame:
-                                        frame_counter += 1
-                                        continue
-                                    if frame_counter > end_frame:
-                                        break
-
-                                    # Reformat frame if needed
-                                    frame = frame.reformat(width=video_stream.codec_context.width,
-                                                        height=video_stream.codec_context.height,
-                                                        format='yuv420p')
-
-                                    packet_out = output_stream.encode(frame)
-                                    if packet_out:
-                                        output_container.mux(packet_out)
-
-                                    frame_counter += 1
-
-                                if frame_counter > end_frame:
-                                    break
-
-                            # Flush encoder
-                            while True:
-                                packet_out = output_stream.encode()
-                                if not packet_out:
-                                    break
-                                output_container.mux(packet_out)
-                                
-                                output_container.close()
-                                container.close()
-
-    
-                # go over each non-turning period and save the video and dlc clips
-
+                # Release resources
+                cap.release()
+                out.release()
 
 if __name__ == "__main__":
     import matplotlib.font_manager as fm
@@ -3749,7 +3385,7 @@ if __name__ == "__main__":
     # add animal identity
     #GeneBG = ['WT', 'Mut', 'Mut', 'WT']
     #GeneBG = ['WT', 'Mut', 'WT', 'Mut', 'Mut', 'WT']
-    fps = 0
+    fps = 50
 
     """analysis
     1. moving distance
@@ -3764,40 +3400,47 @@ if __name__ == "__main__":
     # make these plot functions?
     # plot the cumulative distance traveled
     savemotionpath = os.path.join(root_dir, 'Summary', 'DLC')
-    groups = ['Ctrl', 'Exp']
+    groups = ['WT', 'KO']
     behavior = 'Rotarod'
     DLCSum = DLC_Rotarod(root_dir, fps, groups,behavior)
- # recorded at 4 Hz
     DLCSum.align()
+    #DLCSum.process_for_moseq()
+ # recorded at 4 Hz
     #DLCSum.get_result(self)
 
     back_keypoints = ['spine 3', 'tail 1', 'tail 2', 'tail 3', 'left foot', 'right foot']
     front_keypoints = ['nose', 'left ear', 'right ear', 'left hand', 'right hand']
     #DLCSum.stride_analysis(front_keypoints, back_keypoints)
 
-    #DLCSum.stride_summary()
+    # plot performance
+    #DLCSum.performance()
+    #DLCSum.stride_session()
 
-    #DLCSum.process_for_moseq()
+    DLCSum.stride_summary()
+
+
     # basic motor-related analysis
-    #
-    #DLCSum.center_analysis(savemotionpath)
-    #DLCSum.motion_analysis(savemotionpath)
+    # moseq syllable analysis
+
+    DLCSum.center_analysis(savemotionpath)
+    DLCSum.motion_analysis(savemotionpath)
     # analysis to do
     # moving trace ( require user input to mark the open field area)
     # time spend in the center (same)
     # tail movement in egocentric coordinates
-    #savefigpath = r'D:\openfield_MGRPR\old\Analysis\DLC\1595'
-    #tt=DLCSum.data['DLC_obj'][0].moving_trace(savefigpath)
+    savefigpath = r'D:\openfield_MGRPR\old\Analysis\DLC\1595'
+    tt=DLCSum.data['DLC_obj'][0].moving_trace(savefigpath)
     """ keypoint-moseq analysis"""
     # DLCSum.data['DLC_obj'][0].get_time_in_center()
-    #moseqResults = r'Z:\HongliWang\Rotarod\Cntnap_rotarod\moseq\my_models-3_1e6\results.h5'
+    moseqResults = r'Z:\HongliWang\Rotarod\Rotarod_DLC\Data\Moseq\results.h5'
     MoseqData = Moseq(root_dir)
 
-    #session = MoseqData.sessions[0]
-    #fps = 30
-    #savefigpath = os.path.join(root_dir, 'Analysis', 'Moseq')
+    session = MoseqData.sessions[0]
+    fps = 30
+    savefigpath = os.path.join(root_dir, 'Analysis', 'Moseq')
 
     MoseqData.get_syllables(DLCSum)
+
     #MoseqData.load_syllable_plot(root_dir)
     MoseqData.tail_dist(DLCSum, savefigpath)
 
@@ -3849,6 +3492,3 @@ if __name__ == "__main__":
 #   1. clean the syllables
 #   2. transition
 #   3. average frequency/duration
-#   4. for each syllable, calculate the average pearson correlation of two feets, and the foot distance
-#   5. frequency at different rod speed
-#   6. frequency for different genotypes
