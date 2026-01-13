@@ -31,6 +31,7 @@ import re
 import numpy as np
 from matplotlib import pyplot as plt
 plt.ion()
+import networkx as nx
 
 import imageio
 from natsort import natsorted
@@ -49,6 +50,7 @@ from pyPlotHW import *
 import subprocess 
 import av
 from utils import *
+from utils_HW_KPMS import *
 import matplotlib.gridspec as gridspec
 from matplotlib.cm import get_cmap
 import matplotlib.animation as animation
@@ -57,6 +59,8 @@ from tqdm import tqdm
 from utility_HW import *
 import h5py
 import statsmodels.api as sm
+from scipy.stats import kruskal, mannwhitneyu
+from statsmodels.stats.multitest import multipletests
 from statsmodels.formula.api import ols
 import statsmodels.stats.api as smf
 import io
@@ -1208,7 +1212,9 @@ class Moseq:
         return data
 
     def get_syllables(self, DLCSum):
-        # clean the data, get syllable transition vector
+        # clean the data, get syllable transition vector from clips
+        # combine them in sessions
+
         allClips = list(self.data.keys())
         orig_ts_path = os.path.join(self.root_dir, 'DLCforMoseq_origTS') # csv files that store the original
         orig_ts_files = glob.glob(f"{orig_ts_path}/*.csv")
@@ -1216,14 +1222,21 @@ class Moseq:
 
         # based on DLC results, find every moseq clip that corresponds to the animal and session number
         self.syllable = {} # store syllables by sessions (concatenate clip together)
-
+        self.centroid = {}
+        self.heading = {}
+        self.latent_state = {}
+        all_syllables = set()
 
         for idx, obj in enumerate(DLCSum.data['DLC_obj']):
-            animal = self.data['Animal'][idx]
-            trialIdx = self.data['Trial'][idx]-1
-            animalIdx = self.animals.index(animal)
+            animal = DLCSum.data['Animal'][idx]
+            trialIdx = DLCSum.data['Trial'][idx]
+            date = DLCSum.data['Date'][idx]
+            animalIdx = DLCSum.animals.index(animal)
 
-            included_clips = [s for s in allClips if animal in s and f"trial{trialIdx}" in s]
+            included_clips = [
+                s for s in allClips
+                if f"ASD{animal}" in s and f"trial{trialIdx}" in s and str(date) in s
+            ]
 
             # realign the clips to the original time
             timeStamp = obj.data['time']
@@ -1235,19 +1248,342 @@ class Moseq:
             for clip in included_clips:
                 clip_num = int(clip.split('clip')[-1])
                 match = next((s for s in orig_ts_files 
-                              if animal in s and f"trial{trialIdx}" in s and f"clip{clip_num}" in s), None)
+                              if f"ASD{animal}" in s and f"trial{trialIdx}" in s and f"clip{clip_num}" in s and str(date) in s), None)
                 if match is not None:
-                    orig_time = pd.read_csv(match)['time'].to_numpy()
+                    tsCSV = pd.read_csv(match, header=2)
+                    orig_time = tsCSV['coords'].to_numpy()
                     syllable_clip = self.data[clip]['syllable']
                     centroid_clip = self.data[clip]['centroid']
                     heading_clip = self.data[clip]['heading']
                     latent_state_clip = self.data[clip]['latent_state']
 
-                    syllables[orig_time] = syllable_clip
+                    syllables[orig_time,0] = syllable_clip
                     centroid[orig_time, :] = centroid_clip
-                    heading[orig_time] = heading_clip
+                    heading[orig_time, 0] = heading_clip
                     latent_state[orig_time, :] = latent_state_clip
 
+            syllableKey = f"{animal}_trial{trialIdx}"
+            self.syllable[syllableKey] = syllables
+            self.centroid[syllableKey] = centroid
+            self.heading[syllableKey] = heading
+            self.latent_state[syllableKey] = latent_state
+            all_syllables = all_syllables | set(np.unique(syllables[~np.isnan(syllables)]).tolist())
+        
+        # count syllable frequency first
+        ses_keys = self.syllable.keys()
+        syll_count = np.zeros((len(all_syllables), len(ses_keys)))
+        for s_idx, ses in enumerate(ses_keys):
+            syls = self.syllable[ses]
+            syls = syls[~np.isnan(syls)]
+            # get transition first
+            syls_tran = syls[np.insert(syls[1:] != syls[:-1], 0, True)]
+            for a_idx, a_syl in enumerate(sorted(all_syllables)):
+                syll_count[a_idx, s_idx] = np.sum(syls_tran == a_syl)
+
+        
+        # plot the frequency (combine sessions)
+        syll_count_all = np.sum(syll_count, axis=1)
+        syll_count_norm = syll_count_all / np.sum(syll_count_all)
+        syll_norm = syll_count/np.sum(syll_count, axis=0)
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(syll_norm[:,0])
+
+        #%% plot average syllable frequency for different genotypes and trials
+        nTrials = 12
+        syll_freq = np.full((len(all_syllables), len(DLCSum.animals), nTrials), np.nan)
+        for s_idx, ses in enumerate(ses_keys):
+            animal = ses.split('_trial')[0]
+            trialIdx = int(ses.split('_trial')[-1])
+            animalIdx = DLCSum.animals.index(animal)
+
+            syls = self.syllable[ses]
+            syls = syls[~np.isnan(syls)]
+            # get transition first
+            syls_tran = syls[np.insert(syls[1:] != syls[:-1], 0, True)]
+            for a_idx, a_syl in enumerate(sorted(all_syllables)):
+                syll_freq[a_idx, animalIdx, trialIdx-1] = np.sum(syls_tran == a_syl) / len(syls_tran)
+
+        # plot it in different trials and averaged across genotypes
+        plt.figure(figsize=(15, 8))
+        for tt in range(nTrials):
+            plt.subplot(3, 4, tt+1)
+            mean_freq = np.nanmean(syll_freq[:, DLCSum.GeneBG == 'WT', tt], axis=1)
+            plt.plot(mean_freq[0:30], color='blue', alpha=0.5, label='WT'
+                    )
+            mean_freq_MUT = np.nanmean(syll_freq[:, DLCSum.GeneBG == 'KO', tt], axis=1)
+            plt.plot( mean_freq_MUT[0:30], color='red', alpha=0.5, label='KO')
+            plt.title(f'Trial {tt+1}')
+            # remove the x axis it the subplot is not in the last row
+            if tt < 8:
+                plt.xticks([])
+
+        # save the figures
+        savefigfolder = os.path.join(self.root_dir, 'Summary', 'Moseq')
+        if not os.path.exists(savefigfolder):
+            os.makedirs(savefigfolder)
+        savefigpath = os.path.join(savefigfolder, 'Syllable frequency per trial')
+        # save it in png format
+        plt.savefig(f"{savefigpath}.png", dpi=300)
+
+        # kruskal-wallis test and fdr correction
+        stats = []
+        pvals = []
+
+        for s_idx, a_syl in enumerate(sorted(all_syllables)):
+            if s_idx < 100:
+                # WT: flatten animals × trials
+                wt_mask = DLCSum.GeneBG == 'WT'
+                data_WT = syll_freq[s_idx, wt_mask, :]           # shape: (n_WT_animals, n_trials)
+                data_WT_flat = data_WT.flatten()                # each trial is an observation
+
+                # KO: flatten animals × trials
+                ko_mask = DLCSum.GeneBG == 'KO'
+                data_KO = syll_freq[s_idx, ko_mask, :]
+                data_KO_flat = data_KO.flatten()
+
+                # remove NaNs
+                data_WT_flat = data_WT_flat[~np.isnan(data_WT_flat)]
+                data_KO_flat = data_KO_flat[~np.isnan(data_KO_flat)]
+
+                # Kruskal test
+                if len(data_WT_flat) > 0 and len(data_KO_flat) > 0:  # need at least 1 observation per group
+                    stat, p = kruskal(data_WT_flat, data_KO_flat)
+                    stats.append(stat)
+                    pvals.append(p)
+                else:
+                    stats.append(np.nan)
+                    pvals.append(np.nan)
+
+# FDR correction across the 27 syllables
+        pvals_corrected = multipletests(pvals, method='fdr_bh')[1]
+
+        # overall frequncy (combine trials) with SEM
+        # add a star if significant
+
+        plt.figure(figsize=(15, 8))
+
+        # WT: treat every trial as an individual observation
+        wt_mask = DLCSum.GeneBG == 'WT'
+        syll_wt = syll_freq[:, wt_mask, :]          # shape: (n_syllables, n_WT_animals, n_trials)
+        syll_wt_flat = syll_wt.reshape(syll_wt.shape[0], -1)  # flatten animals and trials together
+
+        mean_freq_wt = np.nanmean(syll_wt_flat, axis=1)
+        sem_freq_wt = np.nanstd(syll_wt_flat, axis=1) / np.sqrt(syll_wt_flat.shape[1])
+
+        plt.plot(mean_freq_wt[0:30], color='blue', alpha=0.5, label='WT')
+        plt.fill_between(np.arange(30),
+                        mean_freq_wt[0:30] - sem_freq_wt[0:30],
+                        mean_freq_wt[0:30] + sem_freq_wt[0:30],
+                        color='blue', alpha=0.2)
+
+        # KO: same procedure
+        ko_mask = DLCSum.GeneBG == 'KO'
+        syll_ko = syll_freq[:, ko_mask, :]
+        syll_ko_flat = syll_ko.reshape(syll_ko.shape[0], -1)
+
+        mean_freq_ko = np.nanmean(syll_ko_flat, axis=1)
+        sem_freq_ko = np.nanstd(syll_ko_flat, axis=1) / np.sqrt(syll_ko_flat.shape[1])
+
+        plt.plot(mean_freq_ko[0:30], color='red', alpha=0.5, label='KO')
+        plt.fill_between(np.arange(30),
+                        mean_freq_ko[0:30] - sem_freq_ko[0:30],
+                        mean_freq_ko[0:30] + sem_freq_ko[0:30],
+                        color='red', alpha=0.2)
+
+        # add significance stars
+        for s_idx in range(30):
+            if pvals_corrected[s_idx] < 0.05:
+                plt.text(s_idx, max(mean_freq_wt[s_idx] + sem_freq_wt[s_idx],
+                                   mean_freq_ko[s_idx] + sem_freq_ko[s_idx]) + 0.001,
+                         '*', ha='center', va='bottom', color='red', fontsize=30)
+        
+        # remove the upper and right boundary
+        ax = plt.gca()
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        plt.title('Overall syllable frequency (per-trial)')
+        plt.xlabel('Syllable index')
+        plt.ylabel('Frequency per trial')
+        plt.legend()
+        plt.show()
+        savefigpath = os.path.join(savefigfolder, 'Syllable frequency overall')
+        # save it in png and svg format
+        plt.savefig(f"{savefigpath}.png", dpi=300)
+        plt.savefig(f"{savefigpath}.svg")
+
+        #%% syllable transition
+        n_syllabels = len(all_syllables)
+        syllable_transition = np.full((n_syllabels, n_syllabels, len(ses_keys)), np.nan)
+        for s_idx, ses in enumerate(ses_keys):
+            syls = self.syllable[ses]
+            syl_trans = get_transition(syls, n_syllabels)
+            syllable_transition[:, :, s_idx] = syl_trans
+
+        def build_transition_graph(T, thresh=0.05):
+            """
+            T: transition counts or probabilities
+            """
+            row_sum = np.nansum(T, axis=1, keepdims=True)
+            T_prob = T / row_sum
+            T_prob = np.nan_to_num(T_prob)
+
+            G = nx.DiGraph()
+            n = T_prob.shape[0]
+
+            for i in range(n):
+                for j in range(n):
+                    if T_prob[i, j] > thresh:
+                        G.add_edge(i, j, weight=T_prob[i, j])
+
+            return G, T_prob
+
+        def extract_main_cycle_freq_weighted(G, state_freq, alpha=1.5):
+            """
+            G: DiGraph with 'weight' on edges
+            state_freq: array of state frequencies
+            """
+            sccs = list(nx.strongly_connected_components(G))
+            sccs = [s for s in sccs if len(s) > 1]
+
+            if not sccs:
+                return []
+
+            def scc_score(scc):
+                edge_score = sum(
+                    G[u][v]['weight']
+                    for u in scc for v in scc
+                    if G.has_edge(u, v)
+                )
+                freq_score = np.mean([state_freq[i] for i in scc])
+                return edge_score * (freq_score ** alpha)
+
+            main_scc = max(sccs, key=scc_score)
+            subG = G.subgraph(main_scc)
+
+            cycles = list(nx.simple_cycles(subG))
+            if not cycles:
+                return list(main_scc)
+
+            def cycle_score(cycle):
+                edge_score = sum(
+                    subG[cycle[i]][cycle[(i+1) % len(cycle)]]['weight']
+                    for i in range(len(cycle))
+                )
+                freq_score = np.mean([state_freq[i] for i in cycle])
+                return edge_score * (freq_score ** alpha)
+
+            return max(cycles, key=cycle_score)
+
+        def circular_layout_for_cycle(cycle, radius=1.0):
+            pos = {}
+            n = len(cycle)
+
+            for i, node in enumerate(cycle):
+                angle = 2 * np.pi * i / n
+                pos[node] = (radius * np.cos(angle), radius * np.sin(angle))
+
+            return pos
+
+        def attach_other_nodes(G, cycle, base_pos, offset=0.5):
+            pos = dict(base_pos)
+
+            others = [n for n in G.nodes if n not in cycle]
+
+            for node in others:
+                # Attach to strongest connection into the cycle
+                connections = [
+                    (nbr, G[nbr][node]['weight'])
+                    for nbr in cycle if G.has_edge(nbr, node)
+                ]
+
+                if connections:
+                    anchor = max(connections, key=lambda x: x[1])[0]
+                    x, y = base_pos[anchor]
+                    pos[node] = (x + offset, y + offset)
+                else:
+                    pos[node] = (0, 0)  # fallback
+
+            return pos
+
+        def plot_backbone_graph(G, cycle, pos, T_prob):
+            plt.figure(figsize=(9, 9))
+
+            # Backbone edges
+            backbone_edges = [
+                (cycle[i], cycle[(i+1) % len(cycle)])
+                for i in range(len(cycle))
+                if G.has_edge(cycle[i], cycle[(i+1) % len(cycle)])
+            ]
+
+            other_edges = [e for e in G.edges if e not in backbone_edges]
+
+            # Draw nodes
+            nx.draw_networkx_nodes(G, pos,
+                                node_size=1000,
+                                node_color='lightgray',
+                                edgecolors='black')
+
+            # Backbone
+            nx.draw_networkx_edges(
+                G, pos,
+                edgelist=backbone_edges,
+                width=4,
+                edge_color='red',
+                arrowsize=30
+            )
+
+            # Other edges
+            weights = [G[u][v]['weight'] for u, v in other_edges]
+            nx.draw_networkx_edges(
+                G, pos,
+                edgelist=other_edges,
+                width=[2 + 5*w for w in weights],
+                edge_color='black',
+                alpha=0.4,
+                arrowsize=15
+            )
+
+            nx.draw_networkx_labels(G, pos, font_size=12)
+
+            plt.title("Syllable transition backbone (dominant loop)")
+            plt.axis('off')
+            plt.show()
+
+        def state_frequency(states, n_states):
+            states = np.asarray(states)
+            freq = np.zeros(n_states)
+
+            valid = ~np.isnan(states)
+            for s in states[valid]:
+                freq[int(s)] += 1
+
+            return freq / freq.sum()
+
+
+        T = syllable_transition[:, :, 10]
+        ses_keys = list(self.syllable.keys())
+        state_freq = state_frequency(self.syllable[ses_keys[0]], T.shape[0])
+        G, T_prob = build_transition_graph(T, thresh=0.05)
+        cycle = extract_main_cycle_freq_weighted(G,state_freq)
+
+        base_pos = circular_layout_for_cycle(cycle)
+        pos = attach_other_nodes(G, cycle, base_pos)
+
+        plot_backbone_graph(G, cycle, pos, T_prob)
+
+    def syllable_analysis(self):
+        #   2. transition
+        #   3. average frequency/duration
+        #   4. for each syllable, calculate the average pearson correlation of two feets, and the foot distance
+        #   5. frequency at different rod speed
+        #   6. frequency for different genotypes
+        pass
+
+    def syllable_freq(self, syllable_array, label, savefigpath):
+        # plot syllable frequency for session/animal/all
+        # label: if the plot is session/animal/all
+        pass
 
 
     def load_syllable_plot(self, root_dir):
@@ -3665,7 +4001,7 @@ class DLC_Rotarod(DLCSummary):
                             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
                             # Use MJPG or XVID for AVI; use mp4v or H264 for MP4
-                            fourcc = cv2.VideoWriter_fourcc(*'XVID')  
+                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  
                             out = cv2.VideoWriter(savevideopath_segment, fourcc, fps, (width, height))
 
                             frame_idx = 0
@@ -3685,47 +4021,74 @@ class DLC_Rotarod(DLCSummary):
 
                             cap.release()
                             out.release()
-                            print(f"Saved frames {start_frame}-{end_frame} to {outputPath}")
 
-                            output_container = av.open(savevideopath_segment, mode='w')
-                            output_stream = output_container.add_stream('mpeg4', rate=fps)
-                            output_stream.width = width
-                            output_stream.height = height
-                            output_stream.pix_fmt = 'yuv420p'
-
-                            frame_counter = 0
-
-                            for packet in container.demux(video_stream):
-                                for frame in packet.decode():
-                                    if frame_counter < start_frame:
-                                        frame_counter += 1
-                                        continue
-                                    if frame_counter > end_frame:
-                                        break
-
-                                    # Reformat frame if needed
-                                    frame = frame.reformat(width=video_stream.codec_context.width,
-                                                        height=video_stream.codec_context.height,
-                                                        format='yuv420p')
-
-                                    packet_out = output_stream.encode(frame)
-                                    if packet_out:
-                                        output_container.mux(packet_out)
-
-                                    frame_counter += 1
-
-                                if frame_counter > end_frame:
-                                    break
-
-                            # Flush encoder
+                            # check if the saved video is corrupted (frames mismatch)
+                            verify_cap = cv2.VideoCapture(savevideopath_segment)
+                            verify_idx = 0
                             while True:
-                                packet_out = output_stream.encode()
-                                if not packet_out:
+                                ret, frame = verify_cap.read()
+                                if not ret:
                                     break
-                                output_container.mux(packet_out)
+                                verify_idx += 1
+
+                            verify_cap.release()
+                            if verify_idx < (end_frame - start_frame + 1):
+                                nonTurningMask = np.zeros(len(obj.data['time']), dtype=bool)
+                                nonTurningMask[start_frame:start_frame+verify_idx] = True
+                                nonTurningMask = [True, True]+ list(nonTurningMask)
+                                saveMask = np.logical_and(tempMask, nonTurningMask)
+                                df_segment = df[saveMask]
+                                orig_index = df_segment.iloc[:,0].copy()
+                                # renumber it
+                                df_segment.iloc[2:,0] = np.arange(len(df_segment)-2)
+
+                                savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
+                                df_segment.to_csv(savefilepath, index=False)
+                                savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
+                                orig_index.to_csv(savetimeStamp, index=False)
+                                # if frames is corrupted, rewrite orig TS and DLC file to match the non-currupted video
+
+                            # print(f"Saved frames {start_frame}-{end_frame} to {outputPath}")
+
+                            # output_container = av.open(savevideopath_segment, mode='w')
+                            # output_stream = output_container.add_stream('mpeg4', rate=fps)
+                            # output_stream.width = width
+                            # output_stream.height = height
+                            # output_stream.pix_fmt = 'yuv420p'
+
+                            # frame_counter = 0
+
+                            # for packet in container.demux(video_stream):
+                            #     for frame in packet.decode():
+                            #         if frame_counter < start_frame:
+                            #             frame_counter += 1
+                            #             continue
+                            #         if frame_counter > end_frame:
+                            #             break
+
+                            #         # Reformat frame if needed
+                            #         frame = frame.reformat(width=video_stream.codec_context.width,
+                            #                             height=video_stream.codec_context.height,
+                            #                             format='yuv420p')
+
+                            #         packet_out = output_stream.encode(frame)
+                            #         if packet_out:
+                            #             output_container.mux(packet_out)
+
+                            #         frame_counter += 1
+
+                            #     if frame_counter > end_frame:
+                            #         break
+
+                            # # Flush encoder
+                            # while True:
+                            #     packet_out = output_stream.encode()
+                            #     if not packet_out:
+                            #         break
+                            #     output_container.mux(packet_out)
                                 
-                                output_container.close()
-                                container.close()
+                            #     output_container.close()
+                            #     container.close()
 
     
                 # go over each non-turning period and save the video and dlc clips
